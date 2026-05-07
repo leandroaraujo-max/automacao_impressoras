@@ -43,12 +43,6 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-if not SNMP_AVAILABLE:
-    log.warning(
-        "pysnmp não instalado — número de série e contador indisponíveis. "
-        "Para habilitar: pip install pysnmp"
-    )
-
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -58,21 +52,23 @@ CSV_PATH = os.path.join(
     'Endereçamento de Rede CDS - Rede CDS.csv',
 )
 
-DNS_SUFFIX      = '.magazineluiza.intranet'
 SNMP_COMMUNITY  = 'public'
-SNMP_TIMEOUT    = 2    # segundos por consulta OID
-HTTP_TIMEOUT    = 3    # segundos por requisição HTTP
+SNMP_TIMEOUT    = 2
+HTTP_TIMEOUT    = 3
 NMAP_ARGS       = '-p 80,443,631,9100 --open -T4'
-MAX_CONCURRENT  = 10   # máximo de processos nmap simultâneos
+MAX_CONCURRENT  = 10
 
 # Standard Printer MIB OIDs (RFC 3805)
-OID_SERIAL     = '1.3.6.1.2.1.43.5.1.1.17.1'   # prtGeneralSerialNumber
-OID_PAGE_COUNT = '1.3.6.1.2.1.43.10.2.1.4.1.1'  # prtMarkerLifeCount
+OID_SERIAL     = '1.3.6.1.2.1.43.5.1.1.17.1'
+OID_PAGE_COUNT = '1.3.6.1.2.1.43.10.2.1.4.1.1'
+
+# Zebra-specific OIDs
+OID_ZEBRA_SERIAL_1 = '1.3.6.1.4.1.10642.1.9.0'   # Zebra enterprise serial
+OID_ZEBRA_SERIAL_2 = '1.3.6.1.4.1.683.6.2.3.2.1.6.1'  # Zebra alt
 
 KNOWN_MANUFACTURERS = frozenset({'HP', 'Samsung', 'Zebra', 'Honeywell'})
 LASER_MANUFACTURERS = frozenset({'HP', 'Samsung'})
 
-# Mapeamento de keywords para identificação de fabricante
 _MFR_KEYWORDS: dict[str, tuple[str, ...]] = {
     'HP':        ('hp', 'laserjet', 'hewlett', 'hp-http', 'jetdirect'),
     'Samsung':   ('samsung',),
@@ -87,9 +83,10 @@ app = Flask(__name__)
 
 _scan_cache:   list[dict] = []
 _scan_running: bool       = False
+_stop_flag:    bool       = False
+_scan_threads: list[threading.Thread] = []
 _cache_lock                = threading.Lock()
 _nmap_sem                  = threading.Semaphore(MAX_CONCURRENT)
-_dns_pool                  = concurrent.futures.ThreadPoolExecutor(max_workers=30, thread_name_prefix='rdns')
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -97,56 +94,27 @@ _dns_pool                  = concurrent.futures.ThreadPoolExecutor(max_workers=3
 @dataclass
 class PrinterInfo:
     ip:         str
-    fila:       str            # PTR reverso (nslookup do IP)
     fabricante: str
     serial:     str
-    contador:   Optional[str]  # somente laser HP/Samsung
+    contador:   Optional[str]
     status:     str
-    filial:     str            # número do CD
-    tipo:       str            # 'laser' | 'termica'
+    filial:     str
+    tipo:       str
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 # ---------------------------------------------------------------------------
-# Resolução de rede — espelha lógica do Atualizar-Redes.ps1
+# Carregar redes do CSV (somente redes já preenchidas no CSV)
 # ---------------------------------------------------------------------------
-def _resolve_dns(name: str) -> Optional[str]:
-    """Resolve hostname para IPv4; tenta nome curto e depois FQDN."""
-    for candidate in (name, f'{name}{DNS_SUFFIX}'):
-        try:
-            ip = socket.gethostbyname(candidate)
-            log.info(f'DNS: {candidate!r} → {ip}')
-            return ip
-        except socket.gaierror:
-            continue
-    log.warning(f'DNS: não resolvido — {name!r}')
-    return None
-
-
-def _ip_to_cidr24(ip: str) -> str:
-    """Converte IP para rede /24 correspondente."""
-    octets = ip.split('.')
-    return f'{octets[0]}.{octets[1]}.{octets[2]}.0/24'
-
-
 def load_network_entries() -> list[dict]:
     """Carrega entradas de rede do CSV fonte.
-
-    Para cada CD (filial), extrai as três faixas de rede:
-      - Rede Imps Lasers       (laser)
-      - Rede imps Térmicas Mesa (térmica)
-      - Rede ImpsTérmicas WIFI  (térmica)
-
-    Quando a coluna de rede está vazia, resolve o hostname da coluna DNS
-    correspondente — mesma lógica do Atualizar-Redes.ps1.
-
-    Retorna lista de: {'network': '10.x.x.0/24', 'cd': '50', 'tipo': 'laser'}
+    Usa apenas colunas de rede já preenchidas — sem tentativa de resolver DNS.
     """
     COLUMN_TRIPLETS = [
-        ('DNS Imps Lasers',          'Rede Imps Lasers',        'laser'),
-        ('DNS imps Térmicas Mesa',   'Rede imps Térmicas Mesa', 'termica'),
-        ('DNS imps Térmicas Mesa.1', 'Rede ImpsTérmicas WIFI',  'termica'),
+        ('Rede Imps Lasers',        'laser'),
+        ('Rede imps Térmicas Mesa', 'termica'),
+        ('Rede ImpsTérmicas WIFI',  'termica'),
     ]
 
     try:
@@ -164,37 +132,24 @@ def load_network_entries() -> list[dict]:
     for _, row in df.iterrows():
         cd = str(row.get('CD', '')).strip()
 
-        for dns_col, net_col, tipo in COLUMN_TRIPLETS:
+        for net_col, tipo in COLUMN_TRIPLETS:
             raw_net = str(row.get(net_col, '')).strip()
 
-            has_network = (
-                raw_net
-                and raw_net not in ('nan', 'NaN', 'DNS_NAO_ENCONTRADO')
-                and '/' in raw_net
-            )
-
-            if has_network:
-                network = raw_net
-            else:
-                dns_name = str(row.get(dns_col, '')).strip()
-                if not dns_name or dns_name == 'nan':
-                    continue
-                resolved_ip = _resolve_dns(dns_name)
-                if not resolved_ip:
-                    continue
-                network = _ip_to_cidr24(resolved_ip)
-
-            # Valida CIDR
-            try:
-                ipaddress.ip_network(network, strict=False)
-            except ValueError:
-                log.warning(f'CIDR inválido ignorado: {network!r}')
+            if (not raw_net
+                    or raw_net in ('nan', 'NaN', 'DNS_NAO_ENCONTRADO')
+                    or '/' not in raw_net):
                 continue
 
-            key = (network, cd)
+            try:
+                ipaddress.ip_network(raw_net, strict=False)
+            except ValueError:
+                log.warning(f'CIDR inválido ignorado: {raw_net!r}')
+                continue
+
+            key = (raw_net, cd)
             if key not in seen:
                 seen.add(key)
-                entries.append({'network': network, 'cd': cd, 'tipo': tipo})
+                entries.append({'network': raw_net, 'cd': cd, 'tipo': tipo})
 
     log.info(f'{len(entries)} entradas de rede carregadas.')
     return entries
@@ -203,8 +158,6 @@ def load_network_entries() -> list[dict]:
 # SNMP — implementação pura Python (fallback sem pysnmp)
 # ---------------------------------------------------------------------------
 def _snmp_get_raw(ip: str, oid: str) -> Optional[str]:
-    """SNMP v1 GET via UDP puro — sem dependências externas."""
-
     def _ber_len(n: int) -> bytes:
         if n < 128:
             return bytes([n])
@@ -261,7 +214,6 @@ def _snmp_get_raw(ip: str, oid: str) -> Optional[str]:
             return None, None, pos
         return tag, data[pos:pos + ln], pos + ln
 
-    # Monta pacote GET
     vb  = _tlv(0x30, _ber_oid(oid) + _tlv(0x05, b''))
     vbl = _tlv(0x30, vb)
     pdu = _tlv(0xa0, _ber_int(1) + _ber_int(0) + _ber_int(0) + vbl)
@@ -275,18 +227,17 @@ def _snmp_get_raw(ip: str, oid: str) -> Optional[str]:
     except Exception:
         return None
 
-    # Navega: Sequence > versão > comunidade > GetResponse PDU
     tag, inner, _ = _read_tlv(resp, 0)
     if tag != 0x30 or inner is None:
         return None
     p = 0
-    for _ in range(2):          # pula versão e comunidade
+    for _ in range(2):
         tag, _, p = _read_tlv(inner, p)
     tag, pdu_val, _ = _read_tlv(inner, p)
     if tag != 0xa2 or pdu_val is None:
         return None
     p = 0
-    for _ in range(3):          # pula reqid, error-status, error-index
+    for _ in range(3):
         tag, _, p = _read_tlv(pdu_val, p)
     tag, vbl_val, _ = _read_tlv(pdu_val, p)
     if tag != 0x30 or vbl_val is None:
@@ -295,22 +246,21 @@ def _snmp_get_raw(ip: str, oid: str) -> Optional[str]:
     if tag != 0x30 or vb_val is None:
         return None
     p = 0
-    tag, _, p = _read_tlv(vb_val, p)   # pula OID
+    tag, _, p = _read_tlv(vb_val, p)
     if tag != 0x06:
         return None
     tag, v_val, _ = _read_tlv(vb_val, p)
     if not v_val:
         return None
-    if tag == 0x04:                     # OctetString (serial)
+    if tag == 0x04:
         decoded = v_val.decode('latin-1', errors='ignore').strip().strip('.')
         return decoded if decoded and not decoded.startswith('\x00') else None
-    if tag in (0x02, 0x41, 0x42, 0x46):  # Integer / Counter32 / Gauge32 / TimeTicks
+    if tag in (0x02, 0x41, 0x42, 0x46):
         return str(int.from_bytes(v_val, 'big', signed=(tag == 0x02)))
     return None
 
 
 def _snmp_get(ip: str, oid: str) -> Optional[str]:
-    """Consulta OID via SNMP v1. Usa pysnmp se disponível, senão raw UDP."""
     if SNMP_AVAILABLE:
         try:
             err_ind, err_st, _, var_binds = next(getCmd(
@@ -326,11 +276,17 @@ def _snmp_get(ip: str, oid: str) -> Optional[str]:
             return value if value else None
         except Exception:
             return None
-    # Fallback: implementação raw sem dependências
     return _snmp_get_raw(ip, oid)
 
 
-def get_serial(ip: str) -> str:
+def get_serial(ip: str, manufacturer: str) -> str:
+    """Obtém serial número; para Zebra tenta OIDs específicos primeiro."""
+    if manufacturer == 'Zebra':
+        for oid in (OID_ZEBRA_SERIAL_1, OID_ZEBRA_SERIAL_2, OID_SERIAL):
+            val = _snmp_get(ip, oid)
+            if val and val != 'N/A':
+                return val
+        return 'N/A'
     return _snmp_get(ip, OID_SERIAL) or 'N/A'
 
 
@@ -348,18 +304,8 @@ def _match_manufacturer(text: str) -> Optional[str]:
     return None
 
 
-def detect_manufacturer(ip: str, fila: str) -> Optional[str]:
-    """Identifica o fabricante. Retorna None para dispositivos desconhecidos.
-
-    Estratégia:
-      1. Nome DNS reverso (fila)
-      2. Header Server + body da porta 80
-    """
-    if fila and fila != 'N/A':
-        brand = _match_manufacturer(fila)
-        if brand:
-            return brand
-
+def detect_manufacturer(ip: str) -> Optional[str]:
+    """Identifica o fabricante via HTTP (header Server + body porta 80)."""
     try:
         req = urllib.request.Request(
             f'http://{ip}/',
@@ -376,60 +322,47 @@ def detect_manufacturer(ip: str, fila: str) -> Optional[str]:
             return brand
     except Exception:
         pass
-
     return None
-
-# ---------------------------------------------------------------------------
-# DNS reverso (coluna "Fila")
-# ---------------------------------------------------------------------------
-def resolve_fila(ip: str) -> str:
-    """Faz nslookup reverso do IP para obter o nome da fila/impressora.
-    Timeout de 3 s para não bloquear o scan em IPs sem PTR record.
-    """
-    try:
-        future = _dns_pool.submit(socket.gethostbyaddr, ip)
-        return future.result(timeout=3.0)[0]
-    except Exception:
-        return 'N/A'
 
 # ---------------------------------------------------------------------------
 # Scan por rede
 # ---------------------------------------------------------------------------
 def scan_network(entry: dict) -> list[dict]:
-    """Varre uma rede e retorna apenas impressoras de fabricantes conhecidos."""
+    global _stop_flag
     network = entry['network']
     cd      = entry['cd']
     tipo    = entry['tipo']
     found: list[dict] = []
 
     with _nmap_sem:
+        if _stop_flag:
+            return found
         try:
             log.info(f'[CD {cd}] Iniciando scan: {network} ({tipo})')
             nm = nmap.PortScanner()
             nm.scan(hosts=network, arguments=NMAP_ARGS)
 
             for host in nm.all_hosts():
+                if _stop_flag:
+                    break
                 if nm[host].state() != 'up':
                     continue
                 if not any(p in nm[host] for p in ('tcp', 'udp')):
                     continue
 
-                fila         = resolve_fila(host)
-                manufacturer = detect_manufacturer(host, fila)
+                manufacturer = detect_manufacturer(host)
 
-                # Ignora dispositivos que não são impressoras conhecidas
                 if manufacturer not in KNOWN_MANUFACTURERS:
                     log.debug(f'[CD {cd}] {host} ignorado — fabricante não identificado')
                     continue
 
-                serial   = get_serial(host)
+                serial   = get_serial(host, manufacturer)
                 contador = None
                 if manufacturer in LASER_MANUFACTURERS and tipo == 'laser':
                     contador = get_page_count(host)
 
                 printer = PrinterInfo(
                     ip=host,
-                    fila=fila,
                     fabricante=manufacturer,
                     serial=serial,
                     contador=contador,
@@ -438,7 +371,7 @@ def scan_network(entry: dict) -> list[dict]:
                     tipo=tipo,
                 ).to_dict()
 
-                log.info(f'[CD {cd}] ✓ {host} ({manufacturer}) — {fila}')
+                log.info(f'[CD {cd}] ok {host} ({manufacturer}) serial={serial}')
                 found.append(printer)
 
         except Exception as exc:
@@ -450,8 +383,9 @@ def scan_network(entry: dict) -> list[dict]:
 # Orquestrador do scan completo
 # ---------------------------------------------------------------------------
 def run_full_scan() -> None:
-    global _scan_cache, _scan_running
+    global _scan_cache, _scan_running, _stop_flag, _scan_threads
     _scan_running = True
+    _stop_flag    = False
     with _cache_lock:
         _scan_cache = []
 
@@ -463,27 +397,41 @@ def run_full_scan() -> None:
 
         log.info(f'Disparando scan para {len(entries)} redes...')
 
+        threads: list[threading.Thread] = []
+
         def _worker(entry: dict) -> None:
             results = scan_network(entry)
-            if results:
+            if results and not _stop_flag:
                 with _cache_lock:
                     _scan_cache.extend(results)
 
-        threads = [
-            threading.Thread(target=_worker, args=(e,), daemon=True, name=f"scan-{e['cd']}-{e['tipo']}")
-            for e in entries
-        ]
+        for e in entries:
+            t = threading.Thread(
+                target=_worker,
+                args=(e,),
+                daemon=True,
+                name=f"scan-{e['cd']}-{e['tipo']}"
+            )
+            threads.append(t)
+
+        with _cache_lock:
+            _scan_threads = threads
+
         for t in threads:
             t.start()
         for t in threads:
             t.join()
 
-        log.info(f'Scan concluído — {len(_scan_cache)} impressoras encontradas.')
+        if _stop_flag:
+            log.info('Scan interrompido pelo usuário.')
+        else:
+            log.info(f'Scan concluído — {len(_scan_cache)} impressoras encontradas.')
 
     except Exception as exc:
         log.error(f'Erro crítico no scan: {exc}')
     finally:
         _scan_running = False
+        _stop_flag    = False
 
 # ---------------------------------------------------------------------------
 # Rotas Flask
@@ -495,11 +443,21 @@ def index():
 
 @app.route('/scan', methods=['POST'])
 def start_scan():
+    global _stop_flag
     if _scan_running:
         log.warning('Scan já em andamento — requisição ignorada.')
         return redirect(url_for('results'))
+    _stop_flag = False
     threading.Thread(target=run_full_scan, daemon=True, name='scan-master').start()
     return redirect(url_for('results'))
+
+
+@app.route('/scan/stop', methods=['POST'])
+def stop_scan():
+    global _stop_flag
+    _stop_flag = True
+    log.info('Sinal de parada enviado pelo usuário.')
+    return jsonify({'status': 'stopping'})
 
 
 @app.route('/api/results')
@@ -508,6 +466,7 @@ def api_results():
         snapshot = list(_scan_cache)
     return jsonify({
         'scan_running': _scan_running,
+        'stop_requested': _stop_flag,
         'total':        len(snapshot),
         'printers':     snapshot,
     })
@@ -522,221 +481,4 @@ def results():
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == '__main__':
-    # use_reloader=False é obrigatório: o reloader cria dois processos e
-    # as threads de scan perdem acesso ao _scan_cache do processo principal.
     app.run(host='0.0.0.0', port=5001, debug=True, use_reloader=False)
-import pandas as pd
-import nmap
-import threading
-import urllib.request
-import urllib.error
-from flask import Flask, render_template, request, redirect, url_for, jsonify
-import logging
-
-# Configuração básica de logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-app = Flask(__name__)
-
-# Cache dos resultados do último scan e flag de estado
-scan_results_cache = []
-scan_is_running = False
-results_lock = threading.Lock()
-
-def detect_manufacturer_http(ip, timeout=3):
-    """Tenta identificar o fabricante pela resposta HTTP da porta 80."""
-    try:
-        req = urllib.request.Request(
-            f'http://{ip}/',
-            headers={'User-Agent': 'Mozilla/5.0'}
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            server = resp.headers.get('Server', '')
-            content = resp.read(4096).decode('utf-8', errors='ignore')
-            combined = (server + ' ' + content).lower()
-            if any(k in combined for k in ('hp ', 'hewlett', 'laserjet', 'hp-http')):
-                return 'HP'
-            if 'samsung' in combined:
-                return 'Samsung'
-            if 'zebra' in combined:
-                return 'Zebra'
-            if 'honeywell' in combined:
-                return 'Honeywell'
-    except Exception:
-        pass
-    return None
-
-
-def get_printer_info(host, port_info):
-    """Extrai informações relevantes da impressora a partir do resultado do nmap."""
-    # .hostname() é o método correto do objeto PortScannerHostDict do python-nmap
-    hostname = port_info.hostname() or 'N/A'
-
-    # 1ª tentativa: identificar pelo hostname DNS reverso
-    combined = hostname.lower()
-    if any(k in combined for k in ('hp', 'laserjet', 'hewlett')):
-        manufacturer = 'HP'
-    elif 'samsung' in combined:
-        manufacturer = 'Samsung'
-    elif 'zebra' in combined:
-        manufacturer = 'Zebra'
-    elif 'honeywell' in combined:
-        manufacturer = 'Honeywell'
-    else:
-        # 2ª tentativa: banner HTTP na porta 80
-        manufacturer = detect_manufacturer_http(host) or 'Outros'
-
-    return {
-        'ip': host,
-        'hostname': hostname,
-        'manufacturer': manufacturer,
-        'status': 'Ativo'
-    }
-
-def scan_network(network_range):
-    """Executa o scan em uma faixa de rede e retorna as impressoras encontradas."""
-    found_printers = []
-    try:
-        logging.info(f"Iniciando scan na rede: {network_range}")
-        nm = nmap.PortScanner()
-        # Scan em portas comuns de impressoras: HTTP, IPP, JetDirect
-        # -R força resolução DNS reversa para todos os hosts (necessário para identificar fabricante pelo hostname)
-        nm.scan(hosts=network_range, arguments='-p 80,443,631,9100 --open -T4 -R')
-        
-        for host in nm.all_hosts():
-            # Considera um host como impressora se tiver alguma das portas abertas
-            if nm[host].state() == 'up' and any(proto in nm[host] for proto in ['tcp', 'udp']):
-                printer_info = get_printer_info(host, nm[host])
-                found_printers.append(printer_info)
-                logging.info(f"Impressora encontrada: {printer_info}")
-
-    except Exception as e:
-        logging.error(f"Erro ao escanear a rede {network_range}: {e}")
-        
-    return found_printers
-
-def run_full_scan():
-    """
-    Lê o arquivo CSV com estrutura complexa, extrai todas as faixas de rede
-    das colunas 'Rede Interna' e dispara o scan para todas elas.
-    """
-    global scan_results_cache, scan_is_running
-    scan_is_running = True
-    scan_results_cache = []
-    printers_found = []
-    try:
-        logging.info("Iniciando leitura do arquivo redes.csv.")
-        # Lê o CSV, pulando a primeira linha e tratando a segunda como cabeçalho.
-        # Os nomes das colunas são definidos manualmente para evitar problemas com duplicatas.
-        # skiprows=2 pula a linha inicial irrelevante E a linha de cabeçalho do CSV
-        df = pd.read_csv('redes.csv', skiprows=2, header=None)
-        # Pega apenas as colunas que precisamos (índices 3 e 8 = 'Rede Interna' de cada bloco)
-        df = df.iloc[:, [3, 8]]
-        df.columns = ['rede_interna_1', 'rede_interna_2']
-
-        # Concatena as duas colunas de redes em uma só
-        redes_series = pd.concat([df['rede_interna_1'], df['rede_interna_2']], ignore_index=True)
-
-        # Limpa os dados: remove valores vazios e espaços extras
-        redes_series = redes_series.dropna().str.strip()
-
-        # Processa células que podem ter múltiplas redes separadas por espaço.
-        # Normaliza o formato "10.0.0.0 /24" (espaço antes da barra) para "10.0.0.0/24"
-        # antes de dividir, para não separar o IP da máscara.
-        all_networks = []
-        for item in redes_series:
-            normalized = item.replace(' /', '/')
-            sub_nets = [net.strip() for net in normalized.split() if '/' in net]
-            all_networks.extend(sub_nets)
-
-        # Remove duplicatas, ordena e valida que a máscara CIDR é numérica
-        networks = sorted([
-            n for n in set(all_networks)
-            if n.split('/')[1].strip().isdigit()
-        ])
-
-        if not networks:
-            logging.warning("Nenhuma faixa de rede válida foi encontrada no arquivo redes.csv.")
-            scan_results_cache = []
-            return
-
-        logging.info(f"Redes encontradas para scan: {networks}")
-
-        threads = []
-        thread_results = []
-
-        def thread_target(net):
-            result = scan_network(net)
-            with results_lock:
-                thread_results.extend(result)
-                # Publica imediatamente no cache global para o polling JS ver
-                scan_results_cache.extend(result)
-
-        for network in networks:
-            if '/' in network:
-                thread = threading.Thread(target=thread_target, args=(network,))
-                threads.append(thread)
-                thread.start()
-            else:
-                logging.warning(f"Formato de rede inválido ignorado: {network}. Use o formato CIDR (ex: 10.70.82.0/24).")
-
-        for thread in threads:
-            thread.join()
-
-        scan_results_cache = thread_results
-        logging.info(f"Scan completo. Total de impressoras encontradas: {len(scan_results_cache)}")
-
-    except FileNotFoundError:
-        logging.error("Arquivo 'redes.csv' não encontrado. Verifique se ele está no mesmo diretório do script.")
-        scan_results_cache = []
-    except Exception as e:
-        logging.error(f"Um erro inesperado ocorreu durante o processamento do arquivo ou scan: {e}")
-        scan_results_cache = []
-    finally:
-        scan_is_running = False
-
-
-@app.route('/')
-def index():
-    """Página inicial que permite iniciar o scan."""
-    return render_template('index.html')
-
-@app.route('/scan', methods=['POST'])
-def start_scan():
-    """Endpoint para iniciar o processo de scan em background."""
-    if scan_is_running:
-        logging.warning("Scan já em andamento. Ignorando nova solicitação.")
-        return redirect(url_for('results'))
-    logging.info("Recebida solicitação de scan.")
-    scan_thread = threading.Thread(target=run_full_scan, daemon=True)
-    scan_thread.start()
-    # Redireciona para /results (GET), evitando 405 no auto-refresh
-    return redirect(url_for('results'))
-
-
-@app.route('/api/results')
-def api_results():
-    """Endpoint JSON para polling em tempo real pelo frontend."""
-    return jsonify({
-        'scan_running': scan_is_running,
-        'total': len(scan_results_cache),
-        'printers': scan_results_cache
-    })
-
-
-@app.route('/results')
-def results():
-    """Exibe os resultados do scan, separados por fabricante."""
-    printers_hp_samsung = [p for p in scan_results_cache if p['manufacturer'] in ['HP', 'Samsung']]
-    printers_zebra_other = [p for p in scan_results_cache if p['manufacturer'] in ['Zebra', 'Honeywell', 'Outros']]
-
-    return render_template('results.html',
-                           printers_hp_samsung=printers_hp_samsung,
-                           printers_zebra_other=printers_zebra_other,
-                           scan_running=scan_is_running)
-
-if __name__ == '__main__':
-    # use_reloader=False é obrigatório para que threads em background
-    # compartilhem o mesmo espaço de memória (global scan_results_cache)
-    app.run(host='0.0.0.0', port=5001, debug=True, use_reloader=False)
-

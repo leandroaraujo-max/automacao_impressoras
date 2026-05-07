@@ -1,56 +1,204 @@
-# 🖨️ Gerenciador de Filas Enterprise (Print Queue Manager)
+# 🖨️ Scanner de Impressoras de Rede
 
-Ferramenta de automação desenvolvida em PowerShell com interface gráfica (WinForms) para padronização, migração de drivers, configuração em massa e gerenciamento de portas TCP/IP de filas de impressão em ambientes Windows Server.
+Kit de automação para inventário e diagnóstico de impressoras distribuídas nos Centros de Distribuição (CDs). Composto por um backend Flask em Python para descoberta ativa na rede e um script PowerShell para manutenção do mapeamento DNS → CIDR.
 
-## 🚀 Funcionalidades (Versão 12.0)
+---
 
-* **Migração de Drivers em Massa:** Substituição automatizada de drivers antigos (ex: Samsung) para novos padrões (ex: HP Universal Printing).
-* **Clonagem de Configurações (PrintTicket):** Padronização de preferências do usuário (ex: forçar impressão Simplex, selecionar Bandeja 2, papel A4).
-* **Configuração de Porta TCP/IP (RAW / LPR):** Alteração do protocolo de porta das filas diretamente nos servidores remotos.
-  * **RAW:** Protocolo 9100, SNMP desativado.
-  * **LPR:** Nome da fila LPR configurado automaticamente com o mesmo nome da impressora, LPR Byte Counting desativado.
-* **Multi-Server via WinRM:** Disparo simultâneo de configurações para múltiplos Print Servers na rede com timeout configurado (15s conexão / 60s operação) — tolerante a instabilidades SD-WAN.
-* **Arquitetura Anti-Freeze:** Timer assíncrono com `Invoke-Command -AsJob` garante que a interface nunca trava, mesmo com spoolers lentos.
-* **Coleta Real de Resultados:** Cada job remoto tem seu resultado coletado via `Receive-Job`. A ListView exibe status real: verde (OK) ou vermelho (ERRO) por fila/servidor.
-* **Auditoria Automática (CSV):** Log `Log_Gerenciador_YYYY-MM-DD.csv` gerado na pasta do script com schema completo: `Usuario, DataHora, Servidor, FilaImpressao, Acao, Status, Mensagem`.
+## 📦 Estrutura do Projeto
+
+```
+Impressoras/
+├── scan_printers.py          # Backend Flask — scanner de rede
+├── redes.csv                 # Cache de redes (gerado/atualizado)
+├── Templates/
+│   ├── index.html            # Página inicial da interface web
+│   └── results.html          # Página de resultados do scan
+└── Redes Imps CDS/
+    ├── Atualizar-Redes.ps1                          # Script PowerShell de atualização DNS
+    ├── Endereçamento de Rede CDS - Rede CDS.csv     # Planilha fonte de endereçamento
+    └── Endereçamento_Atualizado.csv                 # Saída gerada pelo script
+```
+
+---
+
+## 🚀 Componentes
+
+### 1. `scan_printers.py` — Scanner Web (Flask + nmap + SNMP)
+
+Backend web que realiza descoberta ativa de impressoras em todas as redes dos CDs.
+
+**Fabricantes suportados:** HP, Samsung, Zebra, Honeywell
+
+**O que coleta por impressora:**
+
+| Campo | Descrição |
+|-------|-----------|
+| IP | Endereço IPv4 detectado |
+| Fila | PTR reverso (hostname DNS) |
+| Fabricante | Identificado por banner HTTP/SNMP |
+| Serial | Via SNMP OID `1.3.6.1.2.1.43.5.1.1.17.1` |
+| Contador | Páginas totais (somente laser HP/Samsung) via SNMP OID `1.3.6.1.2.1.43.10.2.1.4.1.1` |
+| Tipo | `laser` ou `termica` |
+| Filial | Número do CD |
+| Status | Estado do dispositivo |
+
+**Parâmetros técnicos:**
+
+- Scan de portas: `80, 443, 631, 9100` via nmap (`-T4 --open`)
+- Concorrência: até 10 processos nmap simultâneos + pool de 30 threads DNS
+- Timeout SNMP: 2 s por OID | Timeout HTTP: 3 s por requisição
+- Resolução DNS: tenta nome curto, depois FQDN com sufixo `.magazineluiza.intranet`
+- Fonte de redes: lê `Redes Imps CDS/Endereçamento de Rede CDS - Rede CDS.csv`; se a coluna de rede estiver vazia, resolve o hostname DNS correspondente em tempo real
+
+---
+
+### 2. `Redes Imps CDS/Atualizar-Redes.ps1` — Atualizador de Endereçamento
+
+Script PowerShell que enriquece a planilha de endereçamento resolvendo hostnames para IPs e calculando as redes `/24` correspondentes.
+
+**Colunas processadas:**
+
+| Coluna DNS (entrada) | Coluna Rede (saída) | Tipo |
+|----------------------|---------------------|------|
+| DNS Imps Lasers | Rede Imps Lasers | Laser |
+| DNS imps Térmicas Mesa | Rede imps Térmicas Mesa | Térmica |
+| DNS imps Térmicas Mesa_1 | Rede ImpsTérmicas WIFI | Térmica Wi-Fi |
+
+**Comportamento:**
+- Trata colunas duplicadas no cabeçalho automaticamente (sufixo `_N`)
+- Detecta delimitador automaticamente (`,` ou `;`)
+- Resolução em dois passos: nome curto → FQDN com `.magazineluiza.intranet`
+- Registra `DNS_NAO_ENCONTRADO` quando nenhuma tentativa resolve
+- Não sobrescreve redes que já estão preenchidas na planilha fonte
+
+---
 
 ## 📋 Pré-requisitos
 
-* **Sistema Operacional:** Windows Server 2012 R2, 2016, 2019 ou 2022.
-* **Privilégios:** Administrador Local na máquina de origem. Domain Admin recomendado para execução multi-servidor.
-* **Rede:** WinRM (porta 5985) habilitado e acessível nos servidores de destino.
-* **Porta TCP/IP:** Para uso da ação de configuração de porta, a fila deve utilizar uma porta do tipo TCP/IP padrão (Standard TCP/IP Port Monitor). Portas USB ou outros tipos são ignoradas sem erro.
+### Scanner Web (`scan_printers.py`)
 
-## ⚙️ Instalação e Execução
+```bash
+pip install flask pandas python-nmap pysnmp
+```
 
-1. Copie os arquivos para uma pasta na máquina de origem (ex: `C:\IT_Tools\GerenciadorFilas`).
-2. A pasta deve conter os dois arquivos:
-   * `parametrizar_filas_network.ps1` — código fonte
-   * `Iniciar_Parametrizador.bat` — launcher com auto-elevação UAC
-3. **NÃO execute o `.ps1` diretamente.**
-4. Dê duplo clique em `Iniciar_Parametrizador.bat`. O launcher solicita elevação de privilégios (UAC) e faz bypass da ExecutionPolicy automaticamente.
+| Dependência | Uso |
+|-------------|-----|
+| `flask` | Interface web |
+| `pandas` | Leitura do CSV de endereçamento |
+| `python-nmap` | Varredura de portas |
+| `pysnmp` | Coleta de serial e contador (opcional — serial/contador ficam indisponíveis sem ela) |
 
-## 🖥️ Como Utilizar (Guia Rápido)
+> **nmap** deve estar instalado no sistema e acessível no PATH.
 
-1. **Seção 1 — Origem (Template):** Selecione na máquina local a fila modelo. Ela deve estar com driver correto, bandejas e preferências já configuradas.
-2. **Seção 2 — Ações:** Marque o que deseja executar (combinações são permitidas):
-   * *Aplicar Parametrização:* Copia PrintTicket (Bandeja, Simplex, A4).
-   * *Alterar Driver:* Selecione o driver alvo no combo abaixo do checkbox.
-   * *Configurar Tipo de Porta TCP/IP:* Escolha RAW (9100) ou LPR (fila = nome da impressora).
-3. **Seção 3 — Destino:** Busque e marque as filas que receberão as ações. Os nomes são buscados nos servidores remotos pelo mesmo nome.
-4. **Seção 4 — Servidores:** Cole os hostnames ou IPs dos Print Servers de destino (um por linha). Use `localhost` para testar localmente.
-5. Clique em **DISPARAR AÇÕES SELECIONADAS** e acompanhe o resultado em tempo real no console interno.
+### Script PowerShell (`Atualizar-Redes.ps1`)
 
-## 📂 Arquivos Gerados
-
-* **`Log_Gerenciador_YYYY-MM-DD.csv`** — Criado automaticamente na raiz do script. Contém auditoria completa de cada operação: usuário executor, servidor, fila, ação, status e mensagem de retorno do servidor remoto.
-
-## 🔄 Histórico de Versões
-
-| Versão | Data | Principais Mudanças |
-|--------|------|---------------------|
-| 12.0.0 | 2026-05-07 | Log CSV auditável; coleta real de resultados WinRM (Receive-Job); timeout de sessão WinRM; remoção do limite de 200 filas; configuração de porta TCP/IP (RAW/LPR); status visual real na ListView (OK/ERRO) |
-| 11.0.0 | — | Separação de ações Driver vs Config; arquitetura Anti-Freeze com Timer |
+- PowerShell 5.1 ou superior
+- Acesso DNS à intranet `.magazineluiza.intranet`
+- Não requer módulos externos
 
 ---
-*Desenvolvido para administração de infraestrutura de impressão em alta escala.*
+
+## ⚙️ Como Usar
+
+### Executar o scanner web
+
+```bash
+python scan_printers.py
+```
+
+Acesse `http://localhost:5000` no navegador. Clique em **Iniciar Scan** para disparar a varredura nas redes carregadas do CSV.
+
+### Atualizar o endereçamento de rede
+
+1. Abra a pasta `Redes Imps CDS\`
+2. Execute `Atualizar-Redes.ps1` (duplo clique ou via PowerShell)
+3. O arquivo `Endereçamento_Atualizado.csv` será gerado/atualizado na mesma pasta
+
+> Execute a atualização de endereçamento sempre que CDs novos forem incluídos na planilha fonte ou quando o endereçamento IP de um CD for alterado.
+
+---
+
+## 📂 Arquivos de Saída
+
+| Arquivo | Gerado por | Conteúdo |
+|---------|-----------|---------|
+| `Redes Imps CDS/Endereçamento_Atualizado.csv` | `Atualizar-Redes.ps1` | Planilha com colunas de rede preenchidas (CIDR /24) |
+
+---
+
+## 🛠️ Ambiente de Desenvolvimento
+
+### Python
+
+| Item | Detalhe |
+|------|---------|
+| Versão mínima | Python 3.10+ (testado em 3.14 64-bit) |
+| Interpretador recomendado | `C:\Users\_araujo\AppData\Local\Python\pythoncore-3.14-64\python.exe` |
+| Gerenciador de pacotes | `pip` (embutido) |
+
+**Instalar todas as dependências:**
+
+```powershell
+& "C:\Users\_araujo\AppData\Local\Python\pythoncore-3.14-64\python.exe" -m pip install python-nmap flask pandas pysnmp
+```
+
+**Verificar instalação:**
+
+```powershell
+& "C:\Users\_araujo\AppData\Local\Python\pythoncore-3.14-64\python.exe" -c "import nmap, pandas, flask; print('OK')"
+```
+
+**Dependências completas (incluindo transitivas):**
+
+| Pacote | Versão instalada | Finalidade |
+|--------|-----------------|-----------|
+| `python-nmap` | 0.7.1 | Wrapper do nmap para varredura de portas |
+| `flask` | 3.1.3 | Servidor web / interface de usuário |
+| `pandas` | 3.0.2 | Leitura e processamento do CSV de endereçamento |
+| `pysnmp` | 7.1.26 | Coleta de serial e contador via SNMP (opcional) |
+| `numpy` | 2.4.4 | Dependência do pandas |
+| `werkzeug` | 3.1.8 | Servidor WSGI do Flask |
+| `jinja2` | 3.1.6 | Engine de templates HTML |
+| `pyasn1` | 0.6.3 | Dependência do pysnmp |
+
+### nmap (obrigatório no sistema)
+
+O `python-nmap` é apenas um wrapper — o binário `nmap` precisa estar instalado separadamente.
+
+**Download:** https://nmap.org/download.html  
+**Verificar instalação:**
+
+```powershell
+nmap --version
+```
+
+> Se `nmap` não estiver no PATH, adicione o diretório de instalação (ex: `C:\Program Files (x86)\Nmap`) à variável de ambiente `PATH`.
+
+### PowerShell
+
+| Item | Detalhe |
+|------|---------|
+| Versão mínima | PowerShell 5.1 |
+| Módulos externos | Nenhum |
+| Privilégios necessários | Usuário padrão (sem elevação) |
+| Acesso de rede | DNS resolúvel para `.magazineluiza.intranet` |
+
+### Editor recomendado
+
+- **VS Code** com as extensões:
+  - `ms-python.python` — suporte Python / IntelliSense
+  - `ms-vscode.powershell` — suporte PowerShell
+
+### Executar em desenvolvimento
+
+```powershell
+# A partir da raiz do projeto
+cd "C:\Projetos\Impressoras"
+& "C:\Users\_araujo\AppData\Local\Python\pythoncore-3.14-64\python.exe" scan_printers.py
+```
+
+O Flask sobe em modo debug automaticamente em `http://127.0.0.1:5000`.
+
+---
+
+*Desenvolvido para inventário de infraestrutura de impressão em ambientes multi-CD.*
