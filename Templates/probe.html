@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Probe de Conectividade</title>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: "Segoe UI", system-ui, sans-serif; background: #0f1117; color: #e2e8f0; min-height: 100vh; padding: 24px 20px 60px; }
+        .topbar { display: flex; align-items: center; justify-content: space-between; max-width: 860px; margin: 0 auto 24px; flex-wrap: wrap; gap: 12px; }
+        .topbar h1 { font-size: 1.2rem; font-weight: 700; color: #f1f5f9; display: flex; align-items: center; gap: 8px; }
+        .btn-back { background: #1a1d27; border: 1px solid #2d3148; color: #94a3b8; text-decoration: none; padding: 7px 16px; border-radius: 8px; font-size: .83rem; display: inline-flex; align-items: center; gap: 6px; transition: color .15s; }
+        .btn-back:hover { color: #e2e8f0; }
+        .btn-back svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+        .probe-bar { max-width: 860px; margin: 0 auto 20px; display: flex; gap: 10px; }
+        .probe-input { flex: 1; background: #1a1d27; border: 1px solid #2d3148; border-radius: 8px; color: #e2e8f0; padding: 10px 14px; font-size: .9rem; font-family: "Cascadia Code", Consolas, monospace; outline: none; transition: border-color .15s; }
+        .probe-input:focus { border-color: #3b82f6; }
+        .btn-run { background: #1d4ed8; color: #fff; border: none; border-radius: 8px; padding: 10px 26px; font-size: .9rem; font-weight: 600; cursor: pointer; transition: background .15s; }
+        .btn-run:hover { background: #2563eb; }
+        .btn-run:disabled { background: #374151; cursor: wait; }
+        .loading { max-width: 860px; margin: 0 auto 16px; color: #64748b; font-size: .88rem; display: none; align-items: center; gap: 10px; }
+        .loading.visible { display: flex; }
+        .spinner { width: 16px; height: 16px; border: 2px solid #2d4a8a; border-top-color: #3b82f6; border-radius: 50%; animation: spin .8s linear infinite; flex-shrink: 0; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .results { max-width: 860px; margin: 0 auto; display: none; }
+        .results.visible { display: block; }
+        .section { background: #1a1d27; border: 1px solid #2d3148; border-radius: 12px; margin-bottom: 14px; overflow: hidden; }
+        .section-title { padding: 10px 18px; font-size: .68rem; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: .6px; border-bottom: 1px solid #2d3148; background: #141720; }
+        .prow { display: flex; align-items: baseline; justify-content: space-between; padding: 11px 18px; border-bottom: 1px solid #1e2233; gap: 16px; flex-wrap: wrap; }
+        .prow:last-child { border-bottom: none; }
+        .plabel { font-size: .84rem; color: #94a3b8; min-width: 220px; }
+        .plabel .oid { font-family: "Cascadia Code", Consolas, monospace; font-size: .7rem; color: #475569; display: block; margin-top: 2px; }
+        .pval { flex: 1; text-align: right; font-size: .84rem; }
+        .ok-dot { display: inline-flex; align-items: center; gap: 6px; color: #4ade80; font-weight: 600; font-size: .82rem; }
+        .ok-dot::before { content: ""; width: 7px; height: 7px; background: #4ade80; border-radius: 50%; box-shadow: 0 0 6px #4ade80; flex-shrink: 0; }
+        .fail-dot { display: inline-flex; align-items: center; gap: 6px; color: #f87171; font-weight: 600; font-size: .82rem; }
+        .fail-dot::before { content: ""; width: 7px; height: 7px; background: #f87171; border-radius: 50%; flex-shrink: 0; }
+        .val-mono { font-family: "Cascadia Code", Consolas, monospace; color: #34d399; font-size: .82rem; }
+        .err-txt { color: #f87171; font-size: .79rem; }
+        .ms-txt { color: #475569; font-size: .73rem; margin-left: 6px; }
+        .snippet-box { padding: 10px 18px; background: #111318; font-family: "Cascadia Code", Consolas, monospace; font-size: .72rem; color: #64748b; white-space: pre-wrap; word-break: break-all; max-height: 130px; overflow-y: auto; border-top: 1px solid #1e2233; }
+        .mfr-badge { display: inline-block; padding: 3px 12px; border-radius: 7px; font-size: .78rem; font-weight: 700; border: 1px solid; }
+        .mfr-hp        { background: #0c2044; color: #60a5fa; border-color: #1e3a6e; }
+        .mfr-samsung   { background: #0a1f3a; color: #38bdf8; border-color: #164e7a; }
+        .mfr-zebra     { background: #1a1208; color: #fbbf24; border-color: #5a3e08; }
+        .mfr-honeywell { background: #1a0a0a; color: #f87171; border-color: #5a1414; }
+        .mfr-unknown   { background: #1e2233; color: #64748b; border-color: #374151; }
+    </style>
+</head>
+<body>
+
+<div class="topbar">
+    <h1>&#128269; Probe de Conectividade</h1>
+    <a href="/results" class="btn-back">
+        <svg viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg>
+        Dashboard
+    </a>
+</div>
+
+<div class="probe-bar">
+    <input type="text" id="ip-in" class="probe-input" placeholder="Endere&#231;o IP &#8212; ex: 10.0.1.100"
+           onkeydown="if(event.key==='Enter')runProbe()">
+    <button class="btn-run" id="btn-run" onclick="runProbe()">Testar</button>
+</div>
+
+<div class="loading" id="loading">
+    <span class="spinner"></span> Testando conectividade, aguarde...
+</div>
+
+<div class="results" id="results"></div>
+
+<script>
+'use strict';
+
+var _ip0 = new URLSearchParams(location.search).get('ip');
+if (_ip0) { document.getElementById('ip-in').value = _ip0; runProbe(); }
+
+async function runProbe() {
+    var ip = document.getElementById('ip-in').value.trim();
+    if (!ip) return;
+    history.replaceState(null,'','?ip='+encodeURIComponent(ip));
+    var btn = document.getElementById('btn-run');
+    btn.disabled = true; btn.textContent = 'Testando...';
+    document.getElementById('loading').classList.add('visible');
+    document.getElementById('results').classList.remove('visible');
+    document.getElementById('results').innerHTML = '';
+    try {
+        var data = await fetch('/api/probe?ip='+encodeURIComponent(ip)).then(function(r){return r.json();});
+        if (data.error) {
+            document.getElementById('results').innerHTML = '<div style="color:#f87171;padding:16px">'+esc(data.error)+'</div>';
+        } else {
+            render(data);
+        }
+        document.getElementById('results').classList.add('visible');
+    } catch(e) {
+        document.getElementById('results').innerHTML = '<div style="color:#f87171;padding:16px">Erro ao contactar servidor: '+esc(String(e))+'</div>';
+        document.getElementById('results').classList.add('visible');
+    } finally {
+        btn.disabled = false; btn.textContent = 'Testar';
+        document.getElementById('loading').classList.remove('visible');
+    }
+}
+
+function render(d) {
+    var html = '';
+
+    // Identificacao
+    var mfr = (d.manufacturer||'').toLowerCase().replace(/[^a-z]/g,'');
+    var mfrCls = ['hp','samsung','zebra','honeywell'].indexOf(mfr) >= 0 ? 'mfr-'+mfr : 'mfr-unknown';
+    html += '<div class="section"><div class="section-title">Identificacao</div>';
+    html += row('IP testado', '<span style="font-family:Consolas,monospace;color:#38bdf8">'+esc(d.ip)+'</span>');
+    html += row('Fabricante detectado', '<span class="mfr-badge '+mfrCls+'">'+esc(d.manufacturer||'Nao identificado')+'</span>');
+    html += '</div>';
+
+    // Portas TCP
+    html += '<div class="section"><div class="section-title">Portas TCP</div>';
+    for (var i=0; i<d.ports.length; i++) {
+        var p = d.ports[i], r = p.result;
+        html += row(p.label, r.open
+            ? '<span class="ok-dot">Aberta</span>'+ms(r.ms)
+            : '<span class="fail-dot">Fechada</span> <span class="err-txt">'+esc(r.error||'')+'</span>');
+    }
+    html += '</div>';
+
+    // HTTP
+    var h = d.http;
+    html += '<div class="section"><div class="section-title">HTTP (porta 80)</div>';
+    if (h.ok) {
+        html += row('Conectividade', '<span class="ok-dot">OK &#8212; HTTP '+h.status+'</span>'+ms(h.ms));
+    } else if (h.status) {
+        html += row('Conectividade', '<span class="fail-dot">HTTP '+h.status+'</span>'+ms(h.ms)+' <span class="err-txt">'+esc(h.error||'')+'</span>');
+    } else {
+        html += row('Conectividade', '<span class="fail-dot">Sem resposta</span> <span class="err-txt">'+esc(h.error||'')+'</span>');
+    }
+    if (h.server) html += row('Header Server', '<span class="val-mono">'+esc(h.server)+'</span>');
+    html += '</div>';
+    if (h.snippet) {
+        html += '<div class="section"><div class="section-title">Body HTTP (primeiros 400 bytes)</div>';
+        html += '<div class="snippet-box">'+esc(h.snippet)+'</div></div>';
+    }
+
+    // SNMP
+    html += '<div class="section"><div class="section-title">SNMP &#8212; porta 161/UDP (community: public)</div>';
+    for (var j=0; j<d.snmp.length; j++) {
+        var s = d.snmp[j], sr = s.result;
+        var lbl = esc(s.label)+'<span class="oid">'+esc(sr.oid)+'</span>';
+        if (sr.ok) {
+            html += rowOid(lbl, '<span class="val-mono">'+esc(sr.value)+'</span>'+ms(sr.ms));
+        } else {
+            html += rowOid(lbl, '<span class="fail-dot">Falhou</span> <span class="err-txt">'+esc(sr.error||'sem resposta')+'</span>'+ms(sr.ms));
+        }
+    }
+    html += '</div>';
+
+    document.getElementById('results').innerHTML = html;
+}
+
+function row(label, val) {
+    return '<div class="prow"><span class="plabel">'+esc(label)+'</span><span class="pval">'+val+'</span></div>';
+}
+function rowOid(labelHtml, val) {
+    return '<div class="prow"><span class="plabel">'+labelHtml+'</span><span class="pval">'+val+'</span></div>';
+}
+function ms(v) { return v != null ? '<span class="ms-txt">('+v+' ms)</span>' : ''; }
+function esc(s) {
+    return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+</script>
+</body>
+</html>

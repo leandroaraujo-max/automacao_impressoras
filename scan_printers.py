@@ -13,6 +13,7 @@ import os
 import socket
 import struct
 import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass
@@ -20,7 +21,7 @@ from typing import Optional
 
 import nmap
 import pandas as pd
-from flask import Flask, jsonify, redirect, render_template, url_for
+from flask import Flask, jsonify, redirect, render_template, request, url_for
 
 # ---------------------------------------------------------------------------
 # Optional: SNMP support
@@ -294,6 +295,160 @@ def get_page_count(ip: str) -> Optional[str]:
     return _snmp_get(ip, OID_PAGE_COUNT)
 
 # ---------------------------------------------------------------------------
+# Diagnóstico de conectividade — /api/probe
+# ---------------------------------------------------------------------------
+
+def _probe_tcp(ip: str, port: int) -> dict:
+    """Testa abertura de uma porta TCP."""
+    t0 = time.monotonic()
+    try:
+        with socket.create_connection((ip, port), timeout=2.0):
+            return {'open': True, 'ms': round((time.monotonic() - t0) * 1000)}
+    except socket.timeout:
+        return {'open': False, 'error': 'timeout (2s)'}
+    except ConnectionRefusedError:
+        return {'open': False, 'error': 'recusado (porta fechada)'}
+    except OSError as e:
+        return {'open': False, 'error': str(e)}
+
+
+def _probe_snmp_oid(ip: str, oid: str) -> dict:
+    """SNMP GET com diagnóstico detalhado — distingue timeout, noSuchObject, etc."""
+
+    # BER helpers (auto-contidos)
+    def _bl(n):
+        if n < 128:  return bytes([n])
+        if n < 256:  return b'\x81' + bytes([n])
+        return b'\x82' + bytes([(n >> 8) & 0xff, n & 0xff])
+
+    def _tlv(t, v):  return bytes([t]) + _bl(len(v)) + v
+
+    def _bi(n):
+        if n == 0:  return _tlv(0x02, b'\x00')
+        buf = []; m = n
+        while m:  buf.append(m & 0xff); m >>= 8
+        buf.reverse()
+        if buf[0] & 0x80:  buf.insert(0, 0)
+        return _tlv(0x02, bytes(buf))
+
+    def _boid(s):
+        p = [int(x) for x in s.strip('.').split('.')]
+        r = [p[0] * 40 + p[1]]
+        for v in p[2:]:
+            if v == 0:  r.append(0)
+            else:
+                b = []; x = v
+                while x:  b.append(x & 0x7f); x >>= 7
+                b.reverse()
+                for i in range(len(b) - 1):  b[i] |= 0x80
+                r.extend(b)
+        return _tlv(0x06, bytes(r))
+
+    def _rt(data, pos):
+        if pos + 2 > len(data):  return None, None, pos
+        tag = data[pos]; pos += 1
+        ln  = data[pos]; pos += 1
+        if ln & 0x80:
+            nb = ln & 0x7f
+            if pos + nb > len(data):  return None, None, pos
+            ln = int.from_bytes(data[pos:pos + nb], 'big'); pos += nb
+        if pos + ln > len(data):  return None, None, pos
+        return tag, data[pos:pos + ln], pos + ln
+
+    vb  = _tlv(0x30, _boid(oid) + _tlv(0x05, b''))
+    pdu = _tlv(0xa0, _bi(1) + _bi(0) + _bi(0) + _tlv(0x30, vb))
+    pkt = _tlv(0x30, _bi(0) + _tlv(0x04, SNMP_COMMUNITY.encode()) + pdu)
+
+    out = {'oid': oid, 'value': None, 'ok': False, 'error': None, 'ms': None}
+    t0  = time.monotonic()
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(SNMP_TIMEOUT)
+            s.sendto(pkt, (ip, 161))
+            resp, _ = s.recvfrom(4096)
+        out['ms'] = round((time.monotonic() - t0) * 1000)
+    except socket.timeout:
+        out['error'] = f'Sem resposta UDP (timeout {SNMP_TIMEOUT}s) — SNMP desabilitado ou porta 161 bloqueada'
+        return out
+    except ConnectionRefusedError:
+        out['error'] = 'Porta 161/UDP recusada (ICMP unreachable)'
+        return out
+    except OSError as e:
+        out['error'] = f'Erro de socket: {e}'
+        return out
+
+    _SERRS = {1: 'tooBig', 2: 'noSuchName', 3: 'badValue', 4: 'readOnly', 5: 'genErr'}
+    try:
+        tag, inner, _ = _rt(resp, 0)
+        if tag != 0x30 or inner is None:
+            out['error'] = 'Resposta malformada (tag raiz)'; return out
+        p = 0
+        for _ in range(2):  _, _, p = _rt(inner, p)          # skip version, community
+        tag, pdv, _   = _rt(inner, p)
+        if tag != 0xa2 or pdv is None:
+            out['error'] = f'PDU inesperado 0x{tag:02x} (esperado GetResponse 0xa2)'; return out
+        p = 0
+        _, _, p        = _rt(pdv, p)                          # request-id
+        _, err_b, p    = _rt(pdv, p)                          # error-status
+        _, _, p        = _rt(pdv, p)                          # error-index
+        err = int.from_bytes(err_b, 'big') if err_b else 0
+        if err:
+            out['error'] = f'SNMP error-status {err} ({_SERRS.get(err, "desconhecido")})'; return out
+        _, vbl, _      = _rt(pdv, p)
+        _, vb_v, _     = _rt(vbl or b'', 0)
+        pp = 0
+        _, _, pp       = _rt(vb_v or b'', pp)                 # skip OID
+        vt, vv, _      = _rt(vb_v or b'', pp)
+        _exc = {0x80: 'noSuchObject — OID não existe neste equipamento',
+                0x81: 'noSuchInstance — instância inexistente',
+                0x82: 'endOfMibView'}
+        if vt in _exc:    out['error'] = _exc[vt]; return out
+        if not vv:        out['error'] = 'Valor vazio na resposta'; return out
+        if vt == 0x04:
+            d = vv.decode('latin-1', errors='replace').strip().strip('.')
+            if d and not d.startswith('\x00'):
+                out['value'] = d; out['ok'] = True
+            else:
+                out['error'] = f'OCTET STRING vazio/nulo (hex: {vv.hex()[:32]})'
+        elif vt in (0x02, 0x41, 0x42, 0x46):
+            out['value'] = str(int.from_bytes(vv, 'big', signed=(vt == 0x02))); out['ok'] = True
+        else:
+            out['error'] = f'Tipo desconhecido tag=0x{vt:02x} hex={vv.hex()[:32]}'
+    except Exception as e:
+        out['error'] = f'Erro ao parsear resposta SNMP: {e}'
+    return out
+
+
+def _probe_http(ip: str) -> dict:
+    """HTTP probe na porta 80 com diagnóstico detalhado."""
+    out = {'ok': False, 'status': None, 'server': None,
+           'manufacturer': None, 'ms': None, 'error': None, 'snippet': None}
+    t0  = time.monotonic()
+    try:
+        req = urllib.request.Request(
+            f'http://{ip}/', headers={'User-Agent': 'PrinterProbe/1.0'})
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            out['ms']           = round((time.monotonic() - t0) * 1000)
+            out['status']       = resp.status
+            out['server']       = resp.headers.get('Server', '')
+            body                = resp.read(4096).decode('utf-8', errors='ignore')
+            out['snippet']      = body[:400].strip()
+            out['manufacturer'] = _match_manufacturer(out['server'] + ' ' + body)
+            out['ok']           = True
+    except urllib.error.HTTPError as e:
+        out['ms']     = round((time.monotonic() - t0) * 1000)
+        out['status'] = e.code
+        out['error']  = f'HTTP {e.code} {e.reason}'
+    except urllib.error.URLError as e:
+        out['error']  = f'URLError: {e.reason}'
+    except socket.timeout:
+        out['error']  = f'Timeout ({HTTP_TIMEOUT}s) na porta 80'
+    except Exception as e:
+        out['error']  = str(e)
+    return out
+
+# ---------------------------------------------------------------------------
 # Detecção de fabricante
 # ---------------------------------------------------------------------------
 def _match_manufacturer(text: str) -> Optional[str]:
@@ -431,7 +586,8 @@ def run_full_scan() -> None:
         log.error(f'Erro crítico no scan: {exc}')
     finally:
         _scan_running = False
-        _stop_flag    = False
+        # _stop_flag é preservado para que o último poll do frontend
+        # ainda leia o estado 'interrompido'. Só é resetado em start_scan.
 
 # ---------------------------------------------------------------------------
 # Rotas Flask
@@ -475,6 +631,46 @@ def api_results():
 @app.route('/results')
 def results():
     return render_template('results.html')
+
+
+@app.route('/probe')
+def probe_page():
+    return render_template('probe.html')
+
+
+@app.route('/api/probe')
+def api_probe():
+    ip = request.args.get('ip', '').strip()
+    if not ip:
+        return jsonify({'error': 'Parâmetro ?ip= ausente'}), 400
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        return jsonify({'error': f'IP inválido: {ip!r}'}), 400
+
+    ports = [
+        {'label': 'HTTP (80/TCP)',   'result': _probe_tcp(ip, 80)},
+        {'label': 'HTTPS (443/TCP)', 'result': _probe_tcp(ip, 443)},
+        {'label': 'IPP (631/TCP)',   'result': _probe_tcp(ip, 631)},
+        {'label': 'RAW (9100/TCP)',  'result': _probe_tcp(ip, 9100)},
+    ]
+    snmp = [
+        {'label': 'Serial — padrão RFC3805',  'result': _probe_snmp_oid(ip, OID_SERIAL)},
+        {'label': 'Contador de páginas',      'result': _probe_snmp_oid(ip, OID_PAGE_COUNT)},
+        {'label': 'Zebra Serial (OID 1)',      'result': _probe_snmp_oid(ip, OID_ZEBRA_SERIAL_1)},
+        {'label': 'Zebra Serial (OID 2)',      'result': _probe_snmp_oid(ip, OID_ZEBRA_SERIAL_2)},
+    ]
+    http_result = _probe_http(ip)
+    log.info(f'[probe] {ip} — fabricante={http_result.get("manufacturer")} '
+             f'http={http_result.get("ok")} '
+             f'snmp_serial={snmp[0]["result"].get("ok")}')
+    return jsonify({
+        'ip':           ip,
+        'ports':        ports,
+        'snmp':         snmp,
+        'http':         http_result,
+        'manufacturer': http_result.get('manufacturer') or 'Não identificado',
+    })
 
 
 # ---------------------------------------------------------------------------
