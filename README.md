@@ -9,14 +9,14 @@ Kit de automação para inventário e diagnóstico de impressoras distribuídas 
 ```
 Impressoras/
 ├── scan_printers.py          # Backend Flask — scanner de rede
-├── redes.csv                 # Cache de redes (gerado/atualizado)
 ├── Templates/
 │   ├── index.html            # Página inicial da interface web
-│   └── results.html          # Página de resultados do scan
+│   ├── results.html          # Dashboard de resultados do scan
+│   └── probe.html            # Página de diagnóstico de conectividade
 └── Redes Imps CDS/
-    ├── Atualizar-Redes.ps1                          # Script PowerShell de atualização DNS
-    ├── Endereçamento de Rede CDS - Rede CDS.csv     # Planilha fonte de endereçamento
-    └── Endereçamento_Atualizado.csv                 # Saída gerada pelo script
+    ├── Atualizar-Redes.ps1                  # Script PowerShell de atualização DNS
+    ├── Endereçamento de Rede CDS - Rede CDS.csv  # Planilha fonte de endereçamento
+    └── Endereçamento_Atualizado.csv         # Lida pelo scanner (saída do PS1)
 ```
 
 ---
@@ -47,7 +47,7 @@ Backend web que realiza descoberta ativa de impressoras em todas as redes dos CD
 - Concorrência: até 10 processos nmap simultâneos
 - Timeout SNMP: 2 s por OID | Timeout HTTP: 3 s por requisição
 - **Sem resolução DNS** — usa apenas CIDRs já preenchidos no CSV (IPs sem PTR reverso não causam falhas)
-- Fonte de redes: lê `Redes Imps CDS/Endereçamento de Rede CDS - Rede CDS.csv`, colunas `Rede Imps Lasers`, `Rede imps Térmicas Mesa` e `Rede ImpsTérmicas WIFI`
+- Fonte de redes: lê `Redes Imps CDS/Endereçamento_Atualizado.csv` (gerado por `Atualizar-Redes.ps1`), colunas `Rede Imps Lasers`, `Rede imps Térmicas Mesa` e `Rede ImpsTérmicas WIFI`
 - Interface web: `http://localhost:5001`
 
 **Dashboard (`results.html`):**
@@ -57,6 +57,22 @@ Backend web que realiza descoberta ativa de impressoras em todas as redes dos CD
 - Filtros em tempo real: IP, CD/Filial, Fabricante, Tipo, Serial
 - Cards de totalizadores: Total, Laser, Térmica, CDs encontrados
 - Sem limite de linhas — todas as impressoras encontradas são exibidas
+- Ícone 🔍 em cada IP abre a página de diagnóstico `/probe?ip=X`
+
+**Página de Diagnóstico (`probe.html` — rota `/probe`):**
+
+Permite testar a conectividade e coletar informações detalhadas de qualquer IP antes ou depois do scan.
+
+| Teste | O que verifica |
+|-------|---------------|
+| TCP 80 / 443 / 631 / 9100 | Se a porta está aberta e latência |
+| HTTP (porta 80) | Status code, header `Server`, trecho do body, fabricante identificado |
+| SNMP Serial RFC3805 | `1.3.6.1.2.1.43.5.1.1.17.1` — distingue timeout, noSuchObject, valor vazio |
+| SNMP Contador | `1.3.6.1.2.1.43.10.2.1.4.1.1` |
+| SNMP Zebra OID 1 | `1.3.6.1.4.1.10642.1.9.0` |
+| SNMP Zebra OID 2 | `1.3.6.1.4.1.683.6.2.3.2.1.6.1` |
+
+> Acesso direto: `http://localhost:5001/probe?ip=<endereço>`
 
 ---
 
