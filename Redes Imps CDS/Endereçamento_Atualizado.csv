@@ -1,0 +1,25 @@
+﻿CD,DNS Imps Lasers,Rede Imps Lasers,DNS imps Térmicas Mesa,Rede imps Térmicas Mesa,DNS imps Térmicas Mesa_1,Rede ImpsTérmicas WIFI
+50,imp_050_fat_nf1,10.61.145.0/24,imp_050_exp_etq_01,10.61.145.0/24,imp_050_conf_etq_01,10.61.149.0/24
+94,imp_094_fat_nf1,10.50.242.0/24,imp_094_exp_etq_01,10.50.242.0/24,imp_094_conf_etq_01,10.50.243.0/24
+95,imp_095_fat_nf1,10.100.95.0/24,imp_095_exp_etq_01,DNS_NAO_ENCONTRADO,imp_095_conf_etq_01,DNS_NAO_ENCONTRADO
+300,imp_300_fat_nf1,10.46.225.0/24,imp_300_exp_etq_01,10.46.201.0/24,imp_300_conf_etq_01,10.46.214.0/24
+350,imp_350_fat_nf1,10.70.82.0/24,imp_350_exp_etq_01,10.70.82.0,imp_350_conf_etq_01,10.70.85.0/24
+490,imp_490_fat_nf1,10.101.236.0/24,imp_490_exp_etq_01,10.60.217.0/24,imp_490_conf_etq_01,10.60.220.0/24
+550,imp_550_fat_nf1,10.70.112.0/24,imp_550_exp_etq_01,10.70.112.0/24,imp_550_conf_etq_01,10.70.114.0/24
+590,imp_590_fat_nf1,10.61.2.0/24,imp_590_exp_etq_01,10.61.2.0/24,imp_590_conf_etq_01,10.61.6.0/24
+991,imp_991_fat_nf1,10.60.131.0/24,imp_991_exp_etq_01,10.60.131.0/24,imp_991_conf_etq_01,10.60.132.0/24
+994,imp_994_fat_nf1,10.60.82.0/24,imp_994_exp_etq_01,10.60.82.0/24,imp_994_conf_etq_01,10.60.83.0/24
+997,imp_997_fat_nf1,10.50.160.0/24,imp_997_exp_etq_01,10.104.254.0/24,imp_997_conf_etq_01,DNS_NAO_ENCONTRADO
+1100,imp_1100_fat_nf1,10.60.98.0/24,imp_1100_exp_etq_01,10.60.98.0/24,imp_1100_conf_etq_01,10.60.99./24
+1250,imp_1250_fat_nf1,10.60.2.0/24,imp_1250_exp_etq_01,10.60.2.0/24,imp_1250_conf_etq_01,10.60.3.0/24
+1440,imp_1440_fat_nf1,10.70.96.0/24,imp_1440_exp_etq_01,10.70.96.0/24,imp_1440_conf_etq_01,10.70.98.0/24
+1500,imp_1500_fat_nf1,10.60.18.0/24,imp_1500_exp_etq_01,10.60.18.0/24,imp_1500_conf_etq_01,10.60.19.0/24
+1800,imp_1800_fat_nf1,10.60.34.0/24,imp_1800_exp_etq_01,10.60.34.0/24,imp_1800_conf_etq_01,10.60.35.0/24
+1900,imp_1900_fat_nf1,10.70.49.0/24,imp_1900_exp_etq_01,10.70.53.0/24,imp_1900_conf_etq_01,10.70.54.0/24
+2005,imp_2005_fat_nf1,DNS_NAO_ENCONTRADO,imp_2005_exp_etq_01,DNS_NAO_ENCONTRADO,imp_2005_conf_etq_01,DNS_NAO_ENCONTRADO
+2006,imp_2006_fat_nf1,DNS_NAO_ENCONTRADO,imp_2006_exp_etq_01,DNS_NAO_ENCONTRADO,imp_2006_conf_etq_01,DNS_NAO_ENCONTRADO
+2406,imp_2406_fat_nf1,DNS_NAO_ENCONTRADO,imp_2406_exp_etq_01,DNS_NAO_ENCONTRADO,imp_2406_conf_etq_01,DNS_NAO_ENCONTRADO
+2500,imp_2500_fat_nf1,10.61.130.0/24,imp_2500_exp_etq_01,10.61.130.0/24,imp_2500_conf_etq_01,10.70.59.0/24
+2650,imp_2650_fat_nf1,10.60.226.0/24,imp_2650_exp_etq_01,10.60.226.0/24,imp_2650_conf_etq_01,10.60.229.0/24
+2900,imp_2900_fat_nf1,10.60.178.0/24,imp_2900_exp_etq_01,10.60.178.0/24,imp_2900_conf_etq_01,DNS_NAO_ENCONTRADO
+5200,imp_5200_fat_nf1,10.60.162.0,imp_5200_exp_etq_01,10.60.162.0/24,imp_5200_conf_etq_01,10.60.164.0/24
