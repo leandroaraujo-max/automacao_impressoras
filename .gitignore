@@ -1,0 +1,9 @@
+# Pastas temporárias do Python
+__pycache__/
+
+# Arquivos de dados (planilhas, CSVs com IPs, etc)
+*.csv
+
+# Outros arquivos que você não quer subir
+*.txt
+*.bat
