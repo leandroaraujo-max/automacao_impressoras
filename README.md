@@ -1,6 +1,6 @@
 # 🖨️ Scanner de Impressoras de Rede
 
-Kit de automação para inventário e diagnóstico de impressoras distribuídas nos Centros de Distribuição (CDs). Composto por um backend Flask em Python para descoberta ativa na rede e um script PowerShell para manutenção do mapeamento DNS → CIDR.
+Kit de automação para inventário e diagnóstico de impressoras distribuídas nos Centros de Distribuição (CDs). Composto por um backend Flask em Python para descoberta ativa na rede e um script PowerShell para manutenção do mapeamento de endereçamento CIDR.
 
 ---
 
@@ -34,21 +34,29 @@ Backend web que realiza descoberta ativa de impressoras em todas as redes dos CD
 | Campo | Descrição |
 |-------|-----------|
 | IP | Endereço IPv4 detectado |
-| Fila | PTR reverso (hostname DNS) |
 | Fabricante | Identificado por banner HTTP/SNMP |
-| Serial | Via SNMP OID `1.3.6.1.2.1.43.5.1.1.17.1` |
+| Serial | Via SNMP — OID padrão `1.3.6.1.2.1.43.5.1.1.17.1`; para Zebra tenta `1.3.6.1.4.1.10642.1.9.0` e `1.3.6.1.4.1.683.6.2.3.2.1.6.1` |
 | Contador | Páginas totais (somente laser HP/Samsung) via SNMP OID `1.3.6.1.2.1.43.10.2.1.4.1.1` |
 | Tipo | `laser` ou `termica` |
-| Filial | Número do CD |
+| Filial | Número do CD (extraído do CSV) |
 | Status | Estado do dispositivo |
 
 **Parâmetros técnicos:**
 
 - Scan de portas: `80, 443, 631, 9100` via nmap (`-T4 --open`)
-- Concorrência: até 10 processos nmap simultâneos + pool de 30 threads DNS
+- Concorrência: até 10 processos nmap simultâneos
 - Timeout SNMP: 2 s por OID | Timeout HTTP: 3 s por requisição
-- Resolução DNS: tenta nome curto, depois FQDN com sufixo `.magazineluiza.intranet`
-- Fonte de redes: lê `Redes Imps CDS/Endereçamento de Rede CDS - Rede CDS.csv`; se a coluna de rede estiver vazia, resolve o hostname DNS correspondente em tempo real
+- **Sem resolução DNS** — usa apenas CIDRs já preenchidos no CSV (IPs sem PTR reverso não causam falhas)
+- Fonte de redes: lê `Redes Imps CDS/Endereçamento de Rede CDS - Rede CDS.csv`, colunas `Rede Imps Lasers`, `Rede imps Térmicas Mesa` e `Rede ImpsTérmicas WIFI`
+- Interface web: `http://localhost:5001`
+
+**Dashboard (`results.html`):**
+
+- Botão **Parar Scan** — interrompe a varredura via `POST /scan/stop` (banner laranja ao parar)
+- Resultados agrupados por CD com expand/colapso individual e botões globais
+- Filtros em tempo real: IP, CD/Filial, Fabricante, Tipo, Serial
+- Cards de totalizadores: Total, Laser, Térmica, CDs encontrados
+- Sem limite de linhas — todas as impressoras encontradas são exibidas
 
 ---
 
@@ -106,7 +114,7 @@ pip install flask pandas python-nmap pysnmp
 python scan_printers.py
 ```
 
-Acesse `http://localhost:5000` no navegador. Clique em **Iniciar Scan** para disparar a varredura nas redes carregadas do CSV.
+Acesse `http://localhost:5001` no navegador. Clique em **Iniciar Scan** para disparar a varredura nas redes carregadas do CSV. Use o botão **Parar Scan** na tela de resultados para interromper a varredura a qualquer momento.
 
 ### Atualizar o endereçamento de rede
 
@@ -197,7 +205,7 @@ cd "C:\Projetos\Impressoras"
 & "C:\Users\_araujo\AppData\Local\Python\pythoncore-3.14-64\python.exe" scan_printers.py
 ```
 
-O Flask sobe em modo debug automaticamente em `http://127.0.0.1:5000`.
+O Flask sobe em `http://127.0.0.1:5001` com `use_reloader=False` (evita dupla inicialização no Windows).
 
 ---
 
