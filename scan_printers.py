@@ -50,7 +50,7 @@ log = logging.getLogger(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CSV_PATH = os.path.join(
     BASE_DIR, 'Redes Imps CDS',
-    'Endereçamento de Rede CDS - Rede CDS.csv',
+    'Endereçamento_Atualizado.csv',
 )
 
 SNMP_COMMUNITY  = 'public'
@@ -539,8 +539,7 @@ def scan_network(entry: dict) -> list[dict]:
 # ---------------------------------------------------------------------------
 def run_full_scan() -> None:
     global _scan_cache, _scan_running, _stop_flag, _scan_threads
-    _scan_running = True
-    _stop_flag    = False
+    # _scan_running já foi setado como True em start_scan() antes do redirect
     with _cache_lock:
         _scan_cache = []
 
@@ -599,10 +598,13 @@ def index():
 
 @app.route('/scan', methods=['POST'])
 def start_scan():
-    global _stop_flag
+    global _scan_running, _stop_flag
     if _scan_running:
         log.warning('Scan já em andamento — requisição ignorada.')
         return redirect(url_for('results'))
+    # Seta _scan_running ANTES de redirecionar para que o primeiro poll
+    # do browser já veja scan_running=true e não cancele o interval.
+    _scan_running = True
     _stop_flag = False
     threading.Thread(target=run_full_scan, daemon=True, name='scan-master').start()
     return redirect(url_for('results'))

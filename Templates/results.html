@@ -213,7 +213,8 @@ function appendPrinter(p) {
     if (!tbody) { getOrCreateGroup(p.filial); tbody = document.getElementById('grp-cd-' + p.filial + '-tbody'); }
     tbody.appendChild(makeRow(p));
     updateGroupCounts(p.filial);
-    updateStats(); applyFilters();
+    updateStats();
+    // applyFilters chamado só no final do poll, não a cada impressora
 }
 
 function updateStats() {
@@ -270,7 +271,11 @@ function stopScan() {
 async function poll() {
     try {
         var data = await (await fetch('/api/results')).json();
-        data.printers.forEach(appendPrinter);
+        var hadNew = false;
+        data.printers.forEach(function(p) {
+            if (!knownIPs.has(p.ip)) { appendPrinter(p); hadNew = true; }
+        });
+        if (hadNew) applyFilters();
         var banner = document.getElementById('banner');
         var txt    = document.getElementById('banner-text');
         var btnStop = document.getElementById('btn-stop');
