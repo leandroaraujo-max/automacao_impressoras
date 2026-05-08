@@ -1,27 +1,48 @@
-"""Scanner de Impressoras de Rede
-Backend Flask — Detecta HP, Samsung, Zebra e Honeywell nas redes dos CDs.
+"""Scanner de Impressoras — Inventário Estático + Cache Incremental + Servidor de Probe
+
+Fluxo principal:
+  1. Carrega redes do CSV (CD + Range 01..16)
+  2. Lê cache JSON existente — hosts já conhecidos só têm métrica/consumiveis atualizados
+  3. Novos hosts passam pelo scan completo (nmap + HTTP + SNMP)
+  4. Dados coletados por fabricante:
+       HP      (laser)   → modelo, contador, toner, kit de manutenção
+       Samsung (laser)   → modelo, contador, toner, unidade de imagem
+       Zebra   (térmica) → modelo, odômetro da cabeça (polegadas)
+       Honeywell(térmica)→ modelo, contador de páginas
+  5. Gera inventory.html e salva cache.json
+  6. Flask em :5001 para /probe e /api/cd/<cd>
+
+Uso:
+    python scan_printers.py              # scan completo + atualiza cache
+    python scan_printers.py --update     # só atualiza contadores (sem nmap)
+    python scan_printers.py --probe-only # somente servidor de probe
 
 Requisitos:
     pip install flask pandas python-nmap pysnmp
 """
 from __future__ import annotations
 
-import concurrent.futures
+import argparse
 import ipaddress
+import json
 import logging
 import os
 import socket
-import struct
 import threading
 import time
 import urllib.error
 import urllib.request
+import webbrowser
 from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
+from string import Template
 from typing import Optional
 
+print('[1/3] Carregando dependencias...')
 import nmap
 import pandas as pd
-from flask import Flask, jsonify, redirect, render_template, request, url_for
+print('[2/3] Dependencias OK. Servidor de probe sera iniciado apos o scan.')
 
 # ---------------------------------------------------------------------------
 # Optional: SNMP support
@@ -47,11 +68,12 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CSV_PATH = os.path.join(
-    BASE_DIR, 'Redes Imps CDS',
-    'Endereçamento_Atualizado.csv',
-)
+BASE_DIR       = Path(__file__).parent
+CSV_PATH       = BASE_DIR / 'Redes Imps CDS' / 'Endereçamento_Atualizado.csv'
+INVENTORY_PATH = BASE_DIR / 'inventory.html'
+CACHE_PATH     = BASE_DIR / 'cache.json'
+TEMPLATE_PATH  = BASE_DIR / 'Templates' / 'inventory_template.html'
+PROBE_PORT     = 5001
 
 SNMP_COMMUNITY  = 'public'
 SNMP_TIMEOUT    = 2
@@ -59,48 +81,93 @@ HTTP_TIMEOUT    = 3
 NMAP_ARGS       = '-p 80,443,631,9100 --open -T4'
 MAX_CONCURRENT  = 10
 
-# Standard Printer MIB OIDs (RFC 3805)
-OID_SERIAL     = '1.3.6.1.2.1.43.5.1.1.17.1'
-OID_PAGE_COUNT = '1.3.6.1.2.1.43.10.2.1.4.1.1'
+# ---- OIDs -------------------------------------------------------------------
+# RFC 3805 (Standard Printer MIB)
+OID_SERIAL        = '1.3.6.1.2.1.43.5.1.1.17.1'
+OID_PAGE_COUNT    = '1.3.6.1.2.1.43.10.2.1.4.1.1'
+OID_MODEL_STD     = '1.3.6.1.2.1.25.3.2.1.3.1'   # hrDeviceDescr — modelo genérico
+OID_MODEL_STD2    = '1.3.6.1.2.1.43.5.1.1.16.1'  # prtGeneralPrinterName
 
-# Zebra-specific OIDs
-OID_ZEBRA_SERIAL_1 = '1.3.6.1.4.1.10642.1.9.0'   # Zebra enterprise serial
-OID_ZEBRA_SERIAL_2 = '1.3.6.1.4.1.683.6.2.3.2.1.6.1'  # Zebra alt
+# HP-specific (jetdirect MIB)
+OID_HP_MODEL      = '1.3.6.1.4.1.11.2.3.9.4.2.1.1.3.3.0'   # modelo HP
+OID_HP_TONER      = '1.3.6.1.4.1.11.2.3.9.4.2.1.1.5.28.1'  # toner HP (% restante)
+OID_HP_MAINT_KIT  = '1.3.6.1.4.1.11.2.3.9.4.2.1.1.5.28.5'  # kit manutenção HP
 
-KNOWN_MANUFACTURERS = frozenset({'HP', 'Samsung', 'Zebra', 'Honeywell'})
-LASER_MANUFACTURERS = frozenset({'HP', 'Samsung'})
+# Samsung-specific (CLX/SL MIB)
+OID_SAMSUNG_MODEL = '1.3.6.1.4.1.236.11.5.1.1.1.1.0'        # modelo Samsung
+OID_SAMSUNG_TONER = '1.3.6.1.4.1.236.11.5.11.81.1.1.1.20.1' # toner Samsung (% ou pct)
+OID_SAMSUNG_DRUM  = '1.3.6.1.4.1.236.11.5.11.81.1.1.1.40.1' # unidade de imagem Samsung
+
+# Zebra serial + odômetro
+OID_ZEBRA_SERIAL_1    = '1.3.6.1.4.1.10642.1.9.0'       # ZebraNet MIB
+OID_ZEBRA_SERIAL_2    = '1.3.6.1.4.1.683.6.2.3.2.1.6.1' # Eltron/legado
+OID_ZEBRA_MODEL       = '1.3.6.1.4.1.10642.1.1.7.0'     # ZebraNet model string
+OID_ZEBRA_ODOM_ELTRON = '1.3.6.1.4.1.683.6.2.3.6.1.2.1' # polegadas (legado GK/LP)
+OID_ZEBRA_ODOM_DOTS   = '1.3.6.1.4.1.10642.1.1.8.0'     # dot count (ZT/ZD ÷ DPI)
+ZEBRA_DEFAULT_DPI     = 203
+
+# Honeywell/Intermec
+OID_HONEYWELL_MODEL   = '1.3.6.1.4.1.1248.1.1.3.1.3.0'  # Honeywell model
+
+# ---- Classificação de fabricantes -----------------------------------------
+KNOWN_MANUFACTURERS   = frozenset({'HP', 'Samsung', 'Zebra', 'Honeywell'})
+LASER_MANUFACTURERS   = frozenset({'HP', 'Samsung'})
+THERMAL_MANUFACTURERS = frozenset({'Zebra', 'Honeywell'})
 
 _MFR_KEYWORDS: dict[str, tuple[str, ...]] = {
     'HP':        ('hp', 'laserjet', 'hewlett', 'hp-http', 'jetdirect'),
     'Samsung':   ('samsung',),
-    'Zebra':     ('zebra', 'zpl', 'zt', 'zd'),
+    'Zebra':     ('zebra', 'zpl', 'zebra technologies'),
     'Honeywell': ('honeywell', 'intermec', 'datamax'),
 }
 
-# ---------------------------------------------------------------------------
-# Flask App + estado global thread-safe
-# ---------------------------------------------------------------------------
-app = Flask(__name__)
+# Semáforo para limitar scans nmap paralelos
+_nmap_sem = threading.Semaphore(MAX_CONCURRENT)
 
-_scan_cache:   list[dict] = []
-_scan_running: bool       = False
-_stop_flag:    bool       = False
-_scan_threads: list[threading.Thread] = []
-_cache_lock                = threading.Lock()
-_nmap_sem                  = threading.Semaphore(MAX_CONCURRENT)
+# Status global do scan — exposto via /api/status
+_scan_status: dict = {
+    'running':         False,
+    'total':           0,
+    'networks_done':   0,
+    'networks_total':  0,
+    'started_at':      None,
+    'finished_at':     None,
+}
+
+# Flask é carregado apenas quando o servidor de probe precisa subir
+_flask_app = None
+
+
+def _get_flask_app():
+    """Import e criação lazy do app Flask — evita lentidão no startup."""
+    global _flask_app
+    if _flask_app is not None:
+        return _flask_app
+    from flask import Flask, jsonify, render_template, request as flask_request
+    import logging as _pylog
+    _pylog.getLogger('werkzeug').setLevel(_pylog.WARNING)
+    _flask_app = Flask(__name__)
+    _register_routes(_flask_app, flask_request, jsonify, render_template)
+    return _flask_app
 
 # ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
 @dataclass
 class PrinterInfo:
-    ip:         str
-    fabricante: str
-    serial:     str
-    contador:   Optional[str]
-    status:     str
-    filial:     str
-    tipo:       str
+    ip:           str
+    fabricante:   str
+    modelo:       Optional[str]  # modelo do equipamento (HTTP ou SNMP)
+    serial:       str
+    metrica:      Optional[str]  # páginas (laser) | polegadas (térmica Zebra)
+    # Consumiveis laser
+    toner:        Optional[str]  # % restante ou descrição
+    consumivel2:  Optional[str]  # kit manut. (HP) | unid. imagem (Samsung)
+    status:       str
+    filial:       str
+    tipo:         str            # 'laser' | 'termica' (corrigido pelo fabricante)
+    first_seen:   str            # ISO datetime do primeiro scan
+    last_updated: str            # ISO datetime da última atualização de métrica
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -109,17 +176,13 @@ class PrinterInfo:
 # Carregar redes do CSV (somente redes já preenchidas no CSV)
 # ---------------------------------------------------------------------------
 def load_network_entries() -> list[dict]:
-    """Carrega entradas de rede do CSV fonte.
-    Usa apenas colunas de rede já preenchidas — sem tentativa de resolver DNS.
-    """
-    COLUMN_TRIPLETS = [
-        ('Rede Imps Lasers',        'laser'),
-        ('Rede imps Térmicas Mesa', 'termica'),
-        ('Rede ImpsTérmicas WIFI',  'termica'),
-    ]
+    """Carrega entradas de rede do CSV (estrutura: CD + Range 01..16).
 
+    Todas as redes de um CD são escaneadas sem distinção de tipo —
+    o tipo laser/termica é determinado pelo fabricante detectado no host.
+    """
     try:
-        df = pd.read_csv(CSV_PATH)
+        df = pd.read_csv(CSV_PATH, dtype=str)
     except FileNotFoundError:
         log.error(f'CSV não encontrado: {CSV_PATH}')
         return []
@@ -127,20 +190,23 @@ def load_network_entries() -> list[dict]:
         log.error(f'Erro ao ler CSV: {exc}')
         return []
 
+    # Identifica colunas de range dinamicamente (Range 01, Range 02, ...)
+    range_cols = [c for c in df.columns if c.strip().lower().startswith('range')]
+
     entries: list[dict] = []
     seen: set[tuple] = set()
 
     for _, row in df.iterrows():
         cd = str(row.get('CD', '')).strip()
+        if not cd or cd in ('nan', 'NaN'):
+            continue
 
-        for net_col, tipo in COLUMN_TRIPLETS:
-            raw_net = str(row.get(net_col, '')).strip()
-
+        for col in range_cols:
+            raw_net = str(row.get(col, '')).strip()
             if (not raw_net
-                    or raw_net in ('nan', 'NaN', 'DNS_NAO_ENCONTRADO')
+                    or raw_net in ('nan', 'NaN', '')
                     or '/' not in raw_net):
                 continue
-
             try:
                 ipaddress.ip_network(raw_net, strict=False)
             except ValueError:
@@ -150,9 +216,9 @@ def load_network_entries() -> list[dict]:
             key = (raw_net, cd)
             if key not in seen:
                 seen.add(key)
-                entries.append({'network': raw_net, 'cd': cd, 'tipo': tipo})
+                entries.append({'network': raw_net, 'cd': cd})
 
-    log.info(f'{len(entries)} entradas de rede carregadas.')
+    log.info(f'{len(entries)} redes carregadas para {len({e["cd"] for e in entries})} CDs.')
     return entries
 
 # ---------------------------------------------------------------------------
@@ -291,8 +357,421 @@ def get_serial(ip: str, manufacturer: str) -> str:
     return _snmp_get(ip, OID_SERIAL) or 'N/A'
 
 
+def _http_get_page(ip: str, path: str, use_https: bool = False,
+                   timeout: int = HTTP_TIMEOUT) -> Optional[str]:
+    """GET helper — retorna body (str) ou None em caso de erro."""
+    import ssl
+    scheme = 'https' if use_https else 'http'
+    url = f'{scheme}://{ip}{path}'
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'PrinterScanner/1.0'})
+        if use_https:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                return resp.read(65536).decode('utf-8', errors='ignore')
+        else:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read(65536).decode('utf-8', errors='ignore')
+    except Exception:
+        return None
+
+
 def get_page_count(ip: str) -> Optional[str]:
+    """Contador de páginas — tenta HP XML, depois SNMP padrão."""
+    import re, xml.etree.ElementTree as ET
+    # HP EWS XML — /DevMgmt/ProductUsageDyn.xml
+    for use_https in (True, False):
+        body = _http_get_page(ip, '/DevMgmt/ProductUsageDyn.xml', use_https=use_https)
+        if body:
+            try:
+                root = ET.fromstring(body)
+                # Procura TotalImpressions em qualquer namespace
+                for elem in root.iter():
+                    if 'TotalImpressions' in elem.tag and elem.text:
+                        return elem.text.strip()
+            except Exception:
+                pass
+            # Fallback regex caso XML malformado
+            m = re.search(r'<[^>]*TotalImpressions[^>]*>\s*(\d+)', body)
+            if m:
+                return m.group(1)
     return _snmp_get(ip, OID_PAGE_COUNT)
+
+
+def get_zebra_odometer(ip: str) -> Optional[str]:
+    """Odômetro da cabeça térmica Zebra em polegadas.
+
+    1. HTTP /server/SYSINFO.htm — Head Mileage (ZT/ZD series)
+    2. HTTP /server/CFGPAGE.htm — Config page
+    3. SNMP OID Eltron (polegadas, modelos GK/LP/legado)
+    4. SNMP OID ZebraNet dot count ÷ DPI
+    """
+    import re
+    for path in ('/server/SYSINFO.htm', '/server/CFGPAGE.htm'):
+        body = _http_get_page(ip, path)
+        if not body:
+            continue
+        # Ex: "Head Mileage: 1,234 in" ou "Head Odometer: 1234in"
+        m = re.search(
+            r'Head\s+(?:Mileage|Odometer)\s*[:\-=]?\s*([\d,]+)\s*in',
+            body, re.I)
+        if m:
+            inches = int(m.group(1).replace(',', ''))
+            if 0 < inches < 5_000_000:
+                return f'{inches:,} pol.'
+        # Às vezes reporta em dots
+        m = re.search(
+            r'Head\s+(?:Mileage|Odometer)\s*[:\-=]?\s*([\d,]+)\s*dot',
+            body, re.I)
+        if m:
+            dots = int(m.group(1).replace(',', ''))
+            if dots > 0:
+                return f'{dots // ZEBRA_DEFAULT_DPI:,} pol.'
+
+    # SNMP fallback
+    val = _snmp_get(ip, OID_ZEBRA_ODOM_ELTRON)
+    if val and val.lstrip('-').isdigit():
+        inches = int(val)
+        if 0 < inches < 5_000_000:
+            return f'{inches:,} pol.'
+
+    val = _snmp_get(ip, OID_ZEBRA_ODOM_DOTS)
+    if val and val.lstrip('-').isdigit():
+        dots = int(val)
+        if dots > 0:
+            return f'{dots // ZEBRA_DEFAULT_DPI:,} pol.'
+
+    return None
+
+
+def _decode_html(s: str) -> str:
+    """Decodifica entidades HTML básicas."""
+    return (s.replace('&raquo;', '\u00bb').replace('&laquo;', '\u00ab')
+              .replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
+              .replace('&nbsp;', ' ').replace('&bull;', '\u2022')
+              .replace('&#x2022;', '\u2022').replace('&middot;', '\u00b7')
+              .replace('&ndash;', '\u2013').replace('&mdash;', '\u2014').strip())
+
+
+def get_model(ip: str, manufacturer: str) -> Optional[str]:
+    """Detecta modelo via HTTP (paths específicos por fabricante) + SNMP fallback."""
+    import re
+
+    if manufacturer == 'HP':
+        # NUNCA usar <title> para HP — é sempre "HP » Device Information"
+        # Busca padrão "HP LaserJet..." diretamente no corpo das páginas EWS
+        # Exclui caracteres HTML (&, <, >) para nunca capturar entidades
+        HP_MODEL_RE = re.compile(
+            r'\bHP\s+(?:Color\s+)?'
+            r'(?:LaserJet|PageWide|OfficeJet|DeskJet|Smart\s*Tank|Ink\s*Tank)'
+            r'(?:[^<>&"\n]{2,60})',
+            re.I)
+        for use_https in (True, False):
+            for path in (
+                '/hp/device/DeviceStatus/Index',
+                '/hp/device/DeviceInformation/View',
+                '/hp/device/InternalPages/Index?id=ConfigurationPage',
+            ):
+                body = _http_get_page(ip, path, use_https=use_https)
+                if not body:
+                    continue
+                m = HP_MODEL_RE.search(body)
+                if m:
+                    model = m.group(0).strip().rstrip('.,;: ')
+                    if len(model) > 8 and '&' not in model:
+                        return model
+            if use_https:
+                break  # HTTPS tentado, não precisamos repetir com HTTP se HTTPS funcionou
+
+        # Fallback: XML de configuração HP
+        for use_https in (True, False):
+            body = _http_get_page(ip, '/DevMgmt/ProductConfigDyn.xml', use_https=use_https)
+            if body:
+                for tag in ('dd:DeviceName', 'DeviceName', 'localization:EnglishString'):
+                    m = re.search(rf'<{re.escape(tag)}[^>]*>([^<]{{4,80}})<', body, re.I)
+                    if m:
+                        val = m.group(1).strip()
+                        if 'hp' in val.lower() or len(val) > 6:
+                            return _decode_html(val)
+
+    elif manufacturer == 'Samsung':
+        for path in ('/sws/index.html', '/default.html'):
+            body = _http_get_page(ip, path)
+            if body:
+                m = re.search(r'<title[^>]*>([^<]{4,80})</title>', body, re.I)
+                if m:
+                    title = m.group(1).strip()
+                    generic = ('syncthru', 'web service', 'home', 'index', 'login')
+                    if not any(g in title.lower() for g in generic):
+                        return title
+                m = re.search(
+                    r'(?:Model|Modelo)[^:]*:\s*</[^>]+>\s*<[^>]+>([^<]{4,60})',
+                    body, re.I)
+                if m:
+                    return m.group(1).strip()
+
+    elif manufacturer == 'Zebra':
+        for path in ('/server/SYSINFO.htm', '/config.html'):
+            body = _http_get_page(ip, path)
+            if body:
+                m = re.search(
+                    r'(?:Model|Modelo|Printer\s+Model)\s*[:\-=]\s*'
+                    r'(<[^>]+>)?\s*([A-Za-z0-9][^\n<]{2,50})',
+                    body, re.I)
+                if m:
+                    return m.group(2).strip()
+                m = re.search(r'<title[^>]*>([^<]{4,80})</title>', body, re.I)
+                if m:
+                    title = m.group(1).strip()
+                    if 'zebra' in title.lower() or 'zt' in title.lower():
+                        return title
+
+    # SNMP fallback para todos os fabricantes
+    oid_map = {
+        'HP':        (OID_HP_MODEL, OID_MODEL_STD, OID_MODEL_STD2),
+        'Samsung':   (OID_SAMSUNG_MODEL, OID_MODEL_STD, OID_MODEL_STD2),
+        'Zebra':     (OID_ZEBRA_MODEL, OID_MODEL_STD, OID_MODEL_STD2),
+        'Honeywell': (OID_HONEYWELL_MODEL, OID_MODEL_STD, OID_MODEL_STD2),
+    }
+    for oid in oid_map.get(manufacturer, (OID_MODEL_STD, OID_MODEL_STD2)):
+        val = _snmp_get(ip, oid)
+        if val and _is_valid_model(val):
+            return val.strip()
+
+    return None
+
+
+def _is_valid_model(val: Optional[str], serial: str = '') -> bool:
+    """Retorna True se val parece um modelo real (não lixo, não serial, não HTML)."""
+    import re as _re
+    if not val or len(val) < 3:
+        return False
+    # Rejeita se contém entidade HTML (ex: "HP &raquo; Device Information")
+    if '&' in val and ';' in val:
+        return False
+    # Rejeita caracteres não-imprimíveis (ex: ýèBRBSR8L01H)
+    printable = sum(1 for c in val if c.isprintable() and ord(c) < 128)
+    if printable / len(val) < 0.85:
+        return False
+    # Rejeita serial-like: só maiúsculas + dígitos, sem espaço (ex: BRBSR8L01H)
+    if _re.match(r'^[A-Z0-9]{6,}$', val.strip()):
+        return False
+    # Rejeita labels genéricos de navegação
+    nav_labels = ('device information', 'device status', 'status do dispositivo',
+                  'web service', 'configuration', 'configura')
+    if any(lbl in val.lower() for lbl in nav_labels):
+        return False
+    # Rejeita se igual ou contido no serial
+    if serial and (val.strip() == serial or val.strip() in serial):
+        return False
+    return True
+
+
+def get_hp_consumables(ip: str) -> tuple[Optional[str], Optional[str]]:
+    """Retorna (toner%, kit_manutencao%) para impressoras HP.
+
+    1. HP EWS XML — /DevMgmt/ConsumableConfigDyn.xml (mais confiável)
+    2. HP EWS HTML — /hp/device/InternalPages/Index?id=SuppliesStatus
+    3. SNMP HP MIB fallback
+    """
+    import re, xml.etree.ElementTree as ET
+
+    def _pct(v: str) -> Optional[str]:
+        v = v.strip()
+        if v.isdigit():
+            return f'{int(v)}%'
+        m = re.search(r'(\d+)\s*%', v)
+        return f'{m.group(1)}%' if m else None
+
+    # --- HP EWS XML ---------------------------------------------------------
+    for use_https in (True, False):
+        body = _http_get_page(
+            ip, '/DevMgmt/ConsumableConfigDyn.xml', use_https=use_https)
+        if not body:
+            continue
+        try:
+            root = ET.fromstring(body)
+            toner_pct = kit_pct = None
+            for item in root.iter():
+                tag = item.tag.split('}')[-1]  # remove namespace
+                if tag == 'ConsumableLabelCode':
+                    label = (item.text or '').upper()
+                    # Próximo sibling com percentual
+                    parent = list(root.iter())
+                    idx = parent.index(item)
+                    for sibling in parent[idx:idx + 8]:
+                        stag = sibling.tag.split('}')[-1]
+                        if 'PercentageLevelRemaining' in stag and sibling.text:
+                            pct = f'{sibling.text.strip()}%'
+                            if 'TONER' in label or 'BLACK' in label:
+                                toner_pct = pct
+                            elif 'MAINT' in label or 'FUSER' in label or 'KIT' in label:
+                                kit_pct = pct
+                            break
+            if toner_pct or kit_pct:
+                return toner_pct, kit_pct
+        except Exception:
+            # Fallback regex no XML
+            toner_m = re.search(
+                r'TONER[^<]*</[^>]+>[^<]*<[^>]+>\s*(\d+)', body, re.I)
+            kit_m   = re.search(
+                r'(?:MAINT|FUSER|KIT)[^<]*</[^>]+>[^<]*<[^>]+>\s*(\d+)',
+                body, re.I)
+            return (
+                f'{toner_m.group(1)}%' if toner_m else None,
+                f'{kit_m.group(1)}%'   if kit_m   else None,
+            )
+
+    # --- HP EWS HTML — DeviceStatus (mais simples, mostra Preto/Kit) --------
+    for use_https in (True, False):
+        for hp_path in (
+            '/hp/device/DeviceStatus/Index',
+            '/hp/device/InternalPages/Index?id=SuppliesStatus',
+        ):
+            body = _http_get_page(ip, hp_path, use_https=use_https)
+            if not body:
+                continue
+            # Labels PT: Preto / EN: Black|Toner|Cartridge
+            toner_m = re.search(
+                r'(?:Preto|Black|Toner|Cartridge|CARTRIDGE)'
+                r'[^%]{0,400}?(\d{1,3})\s*%',
+                body, re.I | re.S)
+            # Kit manutencao / Kit alimentador / Maintenance / Fuser
+            kit_m = re.search(
+                r'(?:Kit\b|Maintenance|Fuser|Document\s*Feeder)'
+                r'[^%]{0,400}?(\d{1,3})\s*%',
+                body, re.I | re.S)
+            if toner_m or kit_m:
+                return (
+                    f'{toner_m.group(1)}%' if toner_m else None,
+                    f'{kit_m.group(1)}%'   if kit_m   else None,
+                )
+
+    # --- SNMP fallback -------------------------------------------------------
+    def _snmp_fmt(v: Optional[str]) -> Optional[str]:
+        if not v or not v.lstrip('-').isdigit():
+            return None
+        pct = int(v)
+        return None if pct < 0 else f'{pct}%'
+
+    return _snmp_fmt(_snmp_get(ip, OID_HP_TONER)), _snmp_fmt(_snmp_get(ip, OID_HP_MAINT_KIT))
+
+
+def get_samsung_consumables(ip: str) -> tuple[Optional[str], Optional[str]]:
+    """Retorna (toner%, drum%) para impressoras Samsung.
+
+    1. HTTP SyncThru pages
+    2. SNMP Samsung MIB fallback
+    """
+    import re
+
+    # Samsung SyncThru — tenta obter dados de suprimentos via HTML
+    for path in (
+        '/sws/app/information/reportsAndPages/suppliesStatus',
+        '/sws/index.html',
+        '/default.html',
+    ):
+        body = _http_get_page(ip, path)
+        if not body:
+            continue
+        toner_m = re.search(
+            r'(?:Toner|Black|Cartucho)[^\d]{0,80}(\d{1,3})\s*%', body, re.I)
+        drum_m  = re.search(
+            r'(?:Drum|Tambor|Imaging\s*Unit)[^\d]{0,80}(\d{1,3})\s*%',
+            body, re.I)
+        if toner_m or drum_m:
+            return (
+                f'{toner_m.group(1)}%' if toner_m else None,
+                f'{drum_m.group(1)}%'  if drum_m  else None,
+            )
+
+    # SNMP fallback
+    def _fmt(v: Optional[str]) -> Optional[str]:
+        if not v or not v.lstrip('-').isdigit():
+            return None
+        return f'{int(v)}%'
+    return _fmt(_snmp_get(ip, OID_SAMSUNG_TONER)), _fmt(_snmp_get(ip, OID_SAMSUNG_DRUM))
+
+
+def resolve_tipo(manufacturer: str) -> str:
+    """Zebra e Honeywell são SEMPRE térmicas."""
+    return 'termica' if manufacturer in THERMAL_MANUFACTURERS else 'laser'
+
+
+# ---------------------------------------------------------------------------
+# Cache incremental
+# ---------------------------------------------------------------------------
+def load_cache() -> dict[str, dict]:
+    """Carrega cache.json; retorna dict keyed por IP."""
+    if not CACHE_PATH.exists():
+        return {}
+    try:
+        data = json.loads(CACHE_PATH.read_text(encoding='utf-8'))
+        if isinstance(data, list):
+            return {p['ip']: p for p in data if 'ip' in p}
+        return data
+    except Exception as exc:
+        log.warning(f'Cache corrompido, ignorando: {exc}')
+        return {}
+
+
+def save_cache(printers: list[dict]) -> None:
+    """Persiste lista de impressoras em cache.json."""
+    try:
+        CACHE_PATH.write_text(
+            json.dumps(printers, ensure_ascii=False, indent=2),
+            encoding='utf-8',
+        )
+        log.info(f'Cache salvo: {CACHE_PATH} ({len(printers)} entradas)')
+    except Exception as exc:
+        log.error(f'Erro ao salvar cache: {exc}')
+
+
+def update_metrics_from_cache(cached: dict) -> dict:
+    """Atualiza campos dinâmicos; re-detecta modelo/fabricante se inválidos."""
+    ip     = cached['ip']
+    mfr    = cached.get('fabricante', '')
+    serial = cached.get('serial', '')
+    updated = dict(cached)
+    now = datetime.now().isoformat(timespec='seconds')
+
+    # Re-detecta fabricante se 'Desconhecido' ou vazio
+    if not mfr or mfr == 'Desconhecido':
+        detected = detect_manufacturer(ip)
+        if detected:
+            mfr = detected
+            updated['fabricante'] = mfr
+            updated['tipo'] = resolve_tipo(mfr)
+
+    # Re-detecta modelo se inválido (lixo SNMP, HTML entity, label de navegação ou ausente)
+    modelo_atual = cached.get('modelo') or ''
+    if not _is_valid_model(modelo_atual, serial):
+        novo_modelo = get_model(ip, mfr)
+        if novo_modelo and _is_valid_model(novo_modelo, serial):
+            updated['modelo'] = novo_modelo
+        else:
+            updated['modelo'] = None   # limpa o lixo mesmo se não encontrou novo
+
+    if mfr == 'Zebra':
+        updated['metrica'] = get_zebra_odometer(ip)
+    elif mfr == 'HP':
+        updated['metrica']     = get_page_count(ip)
+        t, k = get_hp_consumables(ip)
+        updated['toner']       = t
+        updated['consumivel2'] = k
+    elif mfr == 'Samsung':
+        updated['metrica']     = get_page_count(ip)
+        t, d = get_samsung_consumables(ip)
+        updated['toner']       = t
+        updated['consumivel2'] = d
+    else:
+        updated['metrica'] = get_page_count(ip)
+
+    updated['last_updated'] = now
+    return updated
+
 
 # ---------------------------------------------------------------------------
 # Diagnóstico de conectividade — /api/probe
@@ -460,73 +939,156 @@ def _match_manufacturer(text: str) -> Optional[str]:
 
 
 def detect_manufacturer(ip: str) -> Optional[str]:
-    """Identifica o fabricante via HTTP (header Server + body porta 80)."""
+    """Identifica o fabricante em 4 etapas:
+    1. SNMP OID padrão (RFC 3805 / Host Resources MIB)
+    2. Paths específicos por fabricante (HP=/hp/device/, Samsung=/sws/, Zebra=/server/)
+    3. HTTP/HTTPS genérico na raiz
+    4. Banner raw TCP porta 9100
+    """
+    # ---- 1. SNMP — mais rápido e universal ---------------------------------
+    for oid in (OID_MODEL_STD, OID_MODEL_STD2):
+        val = _snmp_get_raw(ip, oid)
+        if val:
+            brand = _match_manufacturer(val)
+            if brand:
+                log.debug(f'{ip}: fabricante via SNMP → {brand}')
+                return brand
+
+    # ---- 2. Paths específicos por fabricante --------------------------------
+    # HP EWS — redireciona para HTTPS, usa path /hp/device/
+    for use_https in (True, False):
+        body = _http_get_page(ip, '/hp/device/DeviceInformation/View',
+                              use_https=use_https)
+        if body and ('hp' in body.lower() or 'laserjet' in body.lower()):
+            log.debug(f'{ip}: fabricante via HP EWS → HP')
+            return 'HP'
+
+    # Samsung SyncThru
+    for path in ('/sws/index.html', '/default.html'):
+        body = _http_get_page(ip, path)
+        if body and 'samsung' in body.lower():
+            log.debug(f'{ip}: fabricante via Samsung SyncThru → Samsung')
+            return 'Samsung'
+
+    # Zebra ZebraNet
+    for path in ('/server/SYSINFO.htm', '/server/CFGPAGE.htm', '/config.html'):
+        body = _http_get_page(ip, path)
+        if body and ('zebra' in body.lower() or 'zpl' in body.lower()
+                     or 'zebranet' in body.lower()):
+            log.debug(f'{ip}: fabricante via Zebra Web → Zebra')
+            return 'Zebra'
+
+    # ---- 3. HTTP/HTTPS genérico na raiz ------------------------------------
+    for use_https in (False, True):
+        body = _http_get_page(ip, '/', use_https=use_https)
+        if body:
+            brand = _match_manufacturer(body)
+            if brand:
+                log.debug(f'{ip}: fabricante via HTTP(S) raiz → {brand}')
+                return brand
+
+    # ---- 4. Banner TCP 9100 (JetDirect / ZPL) ------------------------------
     try:
-        req = urllib.request.Request(
-            f'http://{ip}/',
-            headers={'User-Agent': 'PrinterScanner/1.0'},
-        )
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-            combined = (
-                resp.headers.get('Server', '')
-                + ' '
-                + resp.read(4096).decode('utf-8', errors='ignore')
-            )
-        brand = _match_manufacturer(combined)
-        if brand:
-            return brand
+        with socket.create_connection((ip, 9100), timeout=2.0) as s:
+            s.settimeout(2.0)
+            try:
+                banner = s.recv(512).decode('latin-1', errors='ignore')
+            except Exception:
+                banner = ''
+        if banner:
+            brand = _match_manufacturer(banner)
+            if brand:
+                log.debug(f'{ip}: fabricante via porta 9100 → {brand}')
+                return brand
     except Exception:
         pass
+
     return None
 
 # ---------------------------------------------------------------------------
 # Scan por rede
 # ---------------------------------------------------------------------------
-def scan_network(entry: dict) -> list[dict]:
-    global _stop_flag
+def scan_network(entry: dict, known_ips: set[str]) -> list[dict]:
+    """Escaneia uma rede; ignora IPs já no cache (serão atualizados separadamente)."""
     network = entry['network']
     cd      = entry['cd']
-    tipo    = entry['tipo']
     found: list[dict] = []
+    now = datetime.now().isoformat(timespec='seconds')
 
     with _nmap_sem:
-        if _stop_flag:
-            return found
         try:
-            log.info(f'[CD {cd}] Iniciando scan: {network} ({tipo})')
+            log.info(f'[CD {cd}] Scan nmap: {network}')
             nm = nmap.PortScanner()
             nm.scan(hosts=network, arguments=NMAP_ARGS)
 
-            for host in nm.all_hosts():
-                if _stop_flag:
-                    break
+            all_hosts = nm.all_hosts()
+            log.info(f'[CD {cd}] nmap encontrou {len(all_hosts)} host(s) com porta aberta em {network}')
+
+            for host in all_hosts:
                 if nm[host].state() != 'up':
+                    log.debug(f'[CD {cd}] {host} ignorado — estado nmap: {nm[host].state()}')
                     continue
                 if not any(p in nm[host] for p in ('tcp', 'udp')):
+                    log.debug(f'[CD {cd}] {host} ignorado — sem portas TCP/UDP registradas')
                     continue
+                if host in known_ips:
+                    log.debug(f'[CD {cd}] {host} já no cache — será atualizado')
+                    continue  # host já no cache — será atualizado pelo updater
+
+                # Portas de impressão abertas = quase certamente uma impressora
+                open_ports: set[int] = set()
+                for proto in ('tcp', 'udp'):
+                    if proto in nm[host]:
+                        for p, info in nm[host][proto].items():
+                            if info.get('state') == 'open':
+                                open_ports.add(p)
+                is_printer_port = bool(open_ports & {631, 9100})
 
                 manufacturer = detect_manufacturer(host)
-
                 if manufacturer not in KNOWN_MANUFACTURERS:
-                    log.debug(f'[CD {cd}] {host} ignorado — fabricante não identificado')
-                    continue
+                    if is_printer_port:
+                        log.info(f'[CD {cd}] {host} — porta 9100/631 aberta, fabricante nao identificado → adicionado como Desconhecido')
+                        manufacturer = 'Desconhecido'
+                    else:
+                        log.info(f'[CD {cd}] {host} — fabricante nao identificado, sem porta de impressao')
+                        continue
 
-                serial   = get_serial(host, manufacturer)
-                contador = None
-                if manufacturer in LASER_MANUFACTURERS and tipo == 'laser':
-                    contador = get_page_count(host)
+                tipo_real = resolve_tipo(manufacturer)
+                serial    = get_serial(host, manufacturer)
+                modelo    = get_model(host, manufacturer)
+                toner     = None
+                consumivel2 = None
+
+                if manufacturer == 'Zebra':
+                    metrica = get_zebra_odometer(host)
+                elif manufacturer == 'HP':
+                    metrica = get_page_count(host)
+                    toner, consumivel2 = get_hp_consumables(host)
+                elif manufacturer == 'Samsung':
+                    metrica = get_page_count(host)
+                    toner, consumivel2 = get_samsung_consumables(host)
+                else:  # Honeywell
+                    metrica = get_page_count(host)
 
                 printer = PrinterInfo(
                     ip=host,
                     fabricante=manufacturer,
+                    modelo=modelo,
                     serial=serial,
-                    contador=contador,
+                    metrica=metrica,
+                    toner=toner,
+                    consumivel2=consumivel2,
                     status='Online',
                     filial=cd,
-                    tipo=tipo,
+                    tipo=tipo_real,
+                    first_seen=now,
+                    last_updated=now,
                 ).to_dict()
 
-                log.info(f'[CD {cd}] ok {host} ({manufacturer}) serial={serial}')
+                log.info(
+                    f'[CD {cd}] NOVO {host} ({manufacturer}/{tipo_real}) '
+                    f'modelo={modelo} serial={serial} metrica={metrica}'
+                )
                 found.append(printer)
 
         except Exception as exc:
@@ -534,149 +1096,279 @@ def scan_network(entry: dict) -> list[dict]:
 
     return found
 
+
 # ---------------------------------------------------------------------------
-# Orquestrador do scan completo
+# Orquestrador do scan completo (com cache incremental)
 # ---------------------------------------------------------------------------
-def run_full_scan() -> None:
-    global _scan_cache, _scan_running, _stop_flag, _scan_threads
-    # _scan_running já foi setado como True em start_scan() antes do redirect
-    with _cache_lock:
-        _scan_cache = []
+def run_full_scan(update_only: bool = False) -> list[dict]:
+    """Executa scan completo ou só atualiza métricas do cache.
 
-    try:
-        entries = load_network_entries()
-        if not entries:
-            log.warning('Nenhuma entrada de rede carregada. Verifique o CSV.')
-            return
+    update_only=True: sem nmap, só atualiza contadores/consumíveis dos IPs
+                      já presentes no cache.json.
+    """
+    global _scan_status
+    _scan_status['running']        = True
+    _scan_status['started_at']     = datetime.now().isoformat(timespec='seconds')
+    _scan_status['finished_at']    = None
+    _scan_status['networks_done']  = 0
+    _scan_status['networks_total'] = 0
 
-        log.info(f'Disparando scan para {len(entries)} redes...')
+    cache = load_cache()
+    known_ips = set(cache.keys())
 
-        threads: list[threading.Thread] = []
+    all_printers: dict = {}
+    lock = threading.Lock()
 
-        def _worker(entry: dict) -> None:
-            results = scan_network(entry)
-            if results and not _stop_flag:
-                with _cache_lock:
-                    _scan_cache.extend(results)
+    # Pré-carrega cache no dict de trabalho
+    for ip, val in cache.items():
+        all_printers[ip] = val
+    _scan_status['total'] = len(all_printers)
 
-        for e in entries:
-            t = threading.Thread(
-                target=_worker,
-                args=(e,),
-                daemon=True,
-                name=f"scan-{e['cd']}-{e['tipo']}"
-            )
-            threads.append(t)
+    # ---- Passo 1: atualiza métricas dos hosts já conhecidos -----------------
+    if known_ips:
+        log.info(f'Atualizando métricas de {len(known_ips)} hosts em cache...')
 
-        with _cache_lock:
-            _scan_threads = threads
+        def _update_worker(cached: dict) -> None:
+            updated = update_metrics_from_cache(cached)
+            with lock:
+                all_printers[updated['ip']] = updated
+                _scan_status['total'] = len(all_printers)
 
-        for t in threads:
+        threads_upd = [
+            threading.Thread(target=_update_worker, args=(v,), daemon=True)
+            for v in cache.values()
+        ]
+        for t in threads_upd:
             t.start()
-        for t in threads:
+        for t in threads_upd:
             t.join()
 
-        if _stop_flag:
-            log.info('Scan interrompido pelo usuário.')
-        else:
-            log.info(f'Scan concluído — {len(_scan_cache)} impressoras encontradas.')
+        # Salva métricas atualizadas imediatamente
+        save_cache(list(all_printers.values()))
 
-    except Exception as exc:
-        log.error(f'Erro crítico no scan: {exc}')
-    finally:
-        _scan_running = False
-        # _stop_flag é preservado para que o último poll do frontend
-        # ainda leia o estado 'interrompido'. Só é resetado em start_scan.
+    if update_only:
+        result = list(all_printers.values())
+        _scan_status['running']     = False
+        _scan_status['finished_at'] = datetime.now().isoformat(timespec='seconds')
+        return result
+
+    # ---- Passo 2: descobre novos hosts via nmap ------------------------------
+    entries = load_network_entries()
+    if not entries:
+        log.warning('Nenhuma entrada de rede carregada. Verifique o CSV.')
+        _scan_status['running']     = False
+        _scan_status['finished_at'] = datetime.now().isoformat(timespec='seconds')
+        return list(all_printers.values())
+
+    _scan_status['networks_total'] = len(entries)
+    log.info(f'Scan nmap em {len(entries)} redes ({len(known_ips)} hosts já conhecidos)...')
+
+    def _scan_worker(entry: dict) -> None:
+        results = scan_network(entry, known_ips)
+        with lock:
+            for p in results:
+                all_printers[p['ip']] = p
+            _scan_status['total']         = len(all_printers)
+            _scan_status['networks_done'] += 1
+            # Salva cache incrementalmente a cada rede concluída
+            if results:
+                save_cache(list(all_printers.values()))
+
+    threads_scan = [
+        threading.Thread(
+            target=_scan_worker, args=(e,), daemon=True,
+            name=f"scan-{e['cd']}"
+        )
+        for e in entries
+    ]
+    for t in threads_scan:
+        t.start()
+    for t in threads_scan:
+        t.join()
+
+    result = list(all_printers.values())
+    log.info(
+        f'Scan concluído — {len(result)} impressoras '
+        f'({len(result) - len(known_ips)} novas, {len(known_ips)} atualizadas)'
+    )
+    save_cache(result)
+    _scan_status['running']     = False
+    _scan_status['finished_at'] = datetime.now().isoformat(timespec='seconds')
+    return result
 
 # ---------------------------------------------------------------------------
-# Rotas Flask
+# Geração do HTML estático de inventário
 # ---------------------------------------------------------------------------
-@app.route('/')
-def index():
-    return render_template('index.html')
+def generate_inventory_html(printers: list[dict], output_path: Path) -> None:
+    """Lê o template, injeta os dados e grava o inventory.html."""
+    if not TEMPLATE_PATH.exists():
+        log.error(f'Template não encontrado: {TEMPLATE_PATH}')
+        return
+
+    # Lista de CDs únicos ordenada para o filtro da página
+    cds_sorted = sorted({str(p.get('filial', '')) for p in printers if p.get('filial')},
+                        key=lambda x: x.zfill(6))
+
+    timestamp  = datetime.now().strftime('%d/%m/%Y %H:%M')
+    data_json  = json.dumps(printers, ensure_ascii=False)
+    cds_json   = json.dumps(cds_sorted, ensure_ascii=False)
+    total      = str(len(printers))
+
+    raw  = TEMPLATE_PATH.read_text(encoding='utf-8')
+    html = (
+        Template(raw)
+        .safe_substitute(
+            DATA=data_json,
+            CDS=cds_json,
+            TIMESTAMP=timestamp,
+            PROBE_PORT=str(PROBE_PORT),
+            TOTAL=total,
+        )
+    )
+    output_path.write_text(html, encoding='utf-8')
+    log.info(f'Inventário gerado: {output_path}  ({total} impressoras)')
 
 
-@app.route('/scan', methods=['POST'])
-def start_scan():
-    global _scan_running, _stop_flag
-    if _scan_running:
-        log.warning('Scan já em andamento — requisição ignorada.')
-        return redirect(url_for('results'))
-    # Seta _scan_running ANTES de redirecionar para que o primeiro poll
-    # do browser já veja scan_running=true e não cancele o interval.
-    _scan_running = True
-    _stop_flag = False
-    threading.Thread(target=run_full_scan, daemon=True, name='scan-master').start()
-    return redirect(url_for('results'))
+# ---------------------------------------------------------------------------
+# Rotas Flask — registradas via função para suportar import lazy
+# ---------------------------------------------------------------------------
+def _register_routes(flask_app, req, jsonify_fn, render_tmpl):
+    """Registra todas as rotas no app Flask passado como argumento."""
+
+    @flask_app.route('/results')
+    def results():
+        """Regenera o inventário a partir do cache + template e serve."""
+        cache = load_cache()
+        if not cache and not _scan_status['running']:
+            return (
+                '<p style="font-family:sans-serif;padding:2rem;color:#ccc">'
+                'Cache vazio. Execute <code>scan_printers.py</code> primeiro.</p>'
+            ), 404
+        printers = list(cache.values())
+        generate_inventory_html(printers, INVENTORY_PATH)
+        return INVENTORY_PATH.read_text(encoding='utf-8'), 200, {
+            'Content-Type': 'text/html; charset=utf-8'
+        }
+
+    @flask_app.route('/api/status')
+    def api_status():
+        """Status do scan em andamento."""
+        return jsonify_fn(dict(_scan_status))
+
+    @flask_app.route('/api/cds')
+    def api_cds():
+        """Retorna lista de CDs disponíveis no cache."""
+        cache = load_cache()
+        cds = sorted({str(p.get('filial', '')) for p in cache.values() if p.get('filial')},
+                     key=lambda x: x.zfill(6))
+        return jsonify_fn({'cds': cds})
+
+    @flask_app.route('/api/cd/<cd>')
+    def api_cd(cd):
+        """Retorna impressoras de um CD específico a partir do cache."""
+        cache = load_cache()
+        printers = [p for p in cache.values() if str(p.get('filial', '')) == cd]
+        return jsonify_fn({'cd': cd, 'total': len(printers), 'printers': printers})
+
+    @flask_app.route('/probe')
+    def probe_page():
+        return render_tmpl('probe.html')
+
+    @flask_app.route('/api/probe')
+    def api_probe():
+        ip = req.args.get('ip', '').strip()
+        if not ip:
+            return jsonify_fn({'error': 'Parâmetro ?ip= ausente'}), 400
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            return jsonify_fn({'error': f'IP inválido: {ip!r}'}), 400
+
+        ports = [
+            {'label': 'HTTP (80/TCP)',   'result': _probe_tcp(ip, 80)},
+            {'label': 'HTTPS (443/TCP)', 'result': _probe_tcp(ip, 443)},
+            {'label': 'IPP (631/TCP)',   'result': _probe_tcp(ip, 631)},
+            {'label': 'RAW (9100/TCP)',  'result': _probe_tcp(ip, 9100)},
+        ]
+        snmp = [
+            {'label': 'Serial — padrão RFC3805',              'result': _probe_snmp_oid(ip, OID_SERIAL)},
+            {'label': 'Contador de páginas (RFC 3805)',        'result': _probe_snmp_oid(ip, OID_PAGE_COUNT)},
+            {'label': 'Zebra Serial (ZebraNet)',               'result': _probe_snmp_oid(ip, OID_ZEBRA_SERIAL_1)},
+            {'label': 'Zebra Serial (Eltron/legado)',          'result': _probe_snmp_oid(ip, OID_ZEBRA_SERIAL_2)},
+            {'label': 'Zebra Odômetro (ZebraNet, dot count)',  'result': _probe_snmp_oid(ip, OID_ZEBRA_ODOM_DOTS)},
+            {'label': 'Zebra Odômetro (Eltron, polegadas)',    'result': _probe_snmp_oid(ip, OID_ZEBRA_ODOM_ELTRON)},
+            {'label': 'HP Toner (%)',                          'result': _probe_snmp_oid(ip, OID_HP_TONER)},
+            {'label': 'HP Kit Manutenção (%)',                 'result': _probe_snmp_oid(ip, OID_HP_MAINT_KIT)},
+            {'label': 'Samsung Toner (%)',                     'result': _probe_snmp_oid(ip, OID_SAMSUNG_TONER)},
+            {'label': 'Samsung Unidade de Imagem (%)',         'result': _probe_snmp_oid(ip, OID_SAMSUNG_DRUM)},
+        ]
+        http_result = _probe_http(ip)
+        log.info(
+            f'[probe] {ip} — fabricante={http_result.get("manufacturer")} '
+            f'http={http_result.get("ok")} snmp_serial={snmp[0]["result"].get("ok")}'
+        )
+        return jsonify_fn({
+            'ip':           ip,
+            'ports':        ports,
+            'snmp':         snmp,
+            'http':         http_result,
+            'manufacturer': http_result.get('manufacturer') or 'Não identificado',
+        })
 
 
-@app.route('/scan/stop', methods=['POST'])
-def stop_scan():
-    global _stop_flag
-    _stop_flag = True
-    log.info('Sinal de parada enviado pelo usuário.')
-    return jsonify({'status': 'stopping'})
-
-
-@app.route('/api/results')
-def api_results():
-    with _cache_lock:
-        snapshot = list(_scan_cache)
-    return jsonify({
-        'scan_running': _scan_running,
-        'stop_requested': _stop_flag,
-        'total':        len(snapshot),
-        'printers':     snapshot,
-    })
-
-
-@app.route('/results')
-def results():
-    return render_template('results.html')
-
-
-@app.route('/probe')
-def probe_page():
-    return render_template('probe.html')
-
-
-@app.route('/api/probe')
-def api_probe():
-    ip = request.args.get('ip', '').strip()
-    if not ip:
-        return jsonify({'error': 'Parâmetro ?ip= ausente'}), 400
+# ---------------------------------------------------------------------------
+# Scan + abertura do inventário (roda em thread de background)
+# ---------------------------------------------------------------------------
+def _scan_and_open(update_only: bool = False) -> None:
     try:
-        ipaddress.ip_address(ip)
-    except ValueError:
-        return jsonify({'error': f'IP inválido: {ip!r}'}), 400
-
-    ports = [
-        {'label': 'HTTP (80/TCP)',   'result': _probe_tcp(ip, 80)},
-        {'label': 'HTTPS (443/TCP)', 'result': _probe_tcp(ip, 443)},
-        {'label': 'IPP (631/TCP)',   'result': _probe_tcp(ip, 631)},
-        {'label': 'RAW (9100/TCP)',  'result': _probe_tcp(ip, 9100)},
-    ]
-    snmp = [
-        {'label': 'Serial — padrão RFC3805',  'result': _probe_snmp_oid(ip, OID_SERIAL)},
-        {'label': 'Contador de páginas',      'result': _probe_snmp_oid(ip, OID_PAGE_COUNT)},
-        {'label': 'Zebra Serial (OID 1)',      'result': _probe_snmp_oid(ip, OID_ZEBRA_SERIAL_1)},
-        {'label': 'Zebra Serial (OID 2)',      'result': _probe_snmp_oid(ip, OID_ZEBRA_SERIAL_2)},
-    ]
-    http_result = _probe_http(ip)
-    log.info(f'[probe] {ip} — fabricante={http_result.get("manufacturer")} '
-             f'http={http_result.get("ok")} '
-             f'snmp_serial={snmp[0]["result"].get("ok")}')
-    return jsonify({
-        'ip':           ip,
-        'ports':        ports,
-        'snmp':         snmp,
-        'http':         http_result,
-        'manufacturer': http_result.get('manufacturer') or 'Não identificado',
-    })
+        mode = 'atualização incremental' if update_only else 'scan completo'
+        print(f'[3/3] Iniciando {mode}...')
+        printers = run_full_scan(update_only=update_only)
+        generate_inventory_html(printers, INVENTORY_PATH)
+        url = INVENTORY_PATH.as_uri()
+        webbrowser.open(url)
+        log.info(f'Inventário aberto no browser: {url}')
+    except Exception as exc:
+        log.error(f'Erro no scan: {exc}', exc_info=True)
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description='Scanner de impressoras — gera inventário estático HTML'
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        '--probe-only', action='store_true',
+        help='Inicia somente o servidor de probe (sem scan de rede)',
+    )
+    group.add_argument(
+        '--update', action='store_true',
+        help='Atualiza apenas contadores/consumíveis do cache sem rodar nmap',
+    )
+    args = parser.parse_args()
+
+    if args.probe_only:
+        log.info('Modo --probe-only: sem scan de rede.')
+    else:
+        update_only = args.update
+        threading.Thread(
+            target=_scan_and_open, args=(update_only,),
+            daemon=True, name='scan-master'
+        ).start()
+
+    # Importa Flask lazy — só aqui, após o scan já estar rodando em background
+    flask_app = _get_flask_app()
+    import socket as _sock
+    _local_ip = _sock.gethostbyname(_sock.gethostname())
+    print('Servidor acessível em:')
+    print(f'  Inventário (local) : http://127.0.0.1:{PROBE_PORT}/results')
+    print(f'  Inventário (rede)  : http://{_local_ip}:{PROBE_PORT}/results')
+    print(f'  Probe              : http://{_local_ip}:{PROBE_PORT}/probe')
+    flask_app.run(host='0.0.0.0', port=PROBE_PORT, debug=False, use_reloader=False)
+
+
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5001, debug=True, use_reloader=False)
+    main()

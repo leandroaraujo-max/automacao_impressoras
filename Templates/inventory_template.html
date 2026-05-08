@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Inventário de Impressoras</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: "Segoe UI", system-ui, sans-serif; background: #0f1117; color: #e2e8f0; min-height: 100vh; }
+
+/* ---- Layout ---- */
+.sidebar {
+  position: fixed; top: 0; left: 0; bottom: 0; width: 240px;
+  background: #13161f; border-right: 1px solid #2d3148;
+  display: flex; flex-direction: column; z-index: 100; overflow: hidden;
+}
+.main { margin-left: 240px; padding: 24px 24px 60px; min-height: 100vh; }
+
+/* ---- Sidebar ---- */
+.sidebar-header { padding: 18px 16px 14px; border-bottom: 1px solid #2d3148; flex-shrink: 0; }
+.sidebar-header h2 { font-size: .88rem; font-weight: 700; color: #f1f5f9; }
+.sidebar-header .ts { font-size: .68rem; color: #475569; margin-top: 4px; }
+.sidebar-search { padding: 10px 12px; border-bottom: 1px solid #2d3148; flex-shrink: 0; }
+.sidebar-search input {
+  width: 100%; background: #1a1d27; border: 1px solid #2d3148;
+  border-radius: 6px; color: #e2e8f0; padding: 6px 10px;
+  font-size: .8rem; outline: none; transition: border-color .15s;
+}
+.sidebar-search input:focus { border-color: #3b82f6; }
+.cd-list { overflow-y: auto; flex: 1; padding: 6px 0; }
+.cd-item {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 16px; cursor: pointer; font-size: .84rem; color: #94a3b8;
+  transition: background .12s, color .12s; user-select: none; gap: 8px;
+  border-left: 2px solid transparent;
+}
+.cd-item:hover { background: #1a1d27; color: #e2e8f0; }
+.cd-item.active { background: #1a2a4a; color: #60a5fa; border-left-color: #3b82f6; font-weight: 600; }
+.cd-item.cd-hidden { display: none; }
+.cd-item .cd-num { font-weight: 700; }
+.cd-item .cd-cnt { font-size: .68rem; background: #1e2535; border-radius: 10px; padding: 1px 7px; flex-shrink: 0; }
+.cd-item.active .cd-cnt { background: #1a3060; color: #93c5fd; }
+.sidebar-footer { padding: 10px 14px; border-top: 1px solid #2d3148; flex-shrink: 0; display: flex; flex-direction: column; gap: 6px; }
+.sidebar-footer a, .sidebar-footer button {
+  display: block; width: 100%; text-align: center;
+  padding: 7px 10px; border-radius: 7px; font-size: .78rem; font-weight: 600;
+  text-decoration: none; cursor: pointer; border: none; transition: opacity .15s;
+}
+.sidebar-footer a { background: #1a2a4a; color: #60a5fa; }
+.sidebar-footer button { background: #1a2035; border: 1px solid #2d3148; color: #64748b; }
+.sidebar-footer a:hover, .sidebar-footer button:hover { opacity: .8; }
+
+/* ---- Topbar ---- */
+.topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; flex-wrap: wrap; gap: 12px; }
+.topbar h1 { font-size: 1.15rem; font-weight: 700; color: #f1f5f9; }
+.ts-badge { font-size: .76rem; color: #64748b; background: #1a1d27; border: 1px solid #2d3148; border-radius: 20px; padding: 4px 12px; }
+
+/* ---- Stats ---- */
+.stats-bar { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 20px; }
+.stat-card { background: #1a1d27; border: 1px solid #2d3148; border-radius: 10px; padding: 10px 18px; min-width: 110px; }
+.stat-label { font-size: .65rem; color: #64748b; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; }
+.stat-value { font-size: 1.3rem; font-weight: 700; color: #f1f5f9; margin-top: 2px; }
+.stat-value.blue { color: #60a5fa; } .stat-value.amber { color: #fbbf24; } .stat-value.green { color: #4ade80; }
+
+/* ---- Filters ---- */
+.filters-bar { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 16px; }
+.filter-group { display: flex; flex-direction: column; gap: 3px; }
+.filter-group label { font-size: .66rem; color: #64748b; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; }
+.filter-input, .filter-select {
+  background: #1a1d27; border: 1px solid #2d3148; border-radius: 7px;
+  color: #e2e8f0; padding: 6px 10px; font-size: .8rem; min-width: 130px; outline: none; transition: border-color .15s;
+}
+.filter-input:focus, .filter-select:focus { border-color: #3b82f6; }
+.filter-select option { background: #1a1d27; }
+.btn-clear { background: #1a1d27; border: 1px solid #2d3148; color: #64748b; padding: 6px 14px; border-radius: 7px; font-size: .78rem; cursor: pointer; }
+.btn-clear:hover { color: #e2e8f0; border-color: #475569; }
+.visible-count { font-size: .76rem; color: #64748b; align-self: flex-end; margin-left: auto; }
+
+/* ---- Scan status banner ---- */
+.scan-banner {
+  display: flex; align-items: center; gap: 10px; padding: 9px 16px;
+  border-radius: 9px; margin-bottom: 18px; font-size: .82rem; font-weight: 600;
+  border: 1px solid; transition: opacity .3s;
+}
+.scan-banner.running  { background: #1a2a4a; border-color: #2d4a8a; color: #60a5fa; }
+.scan-banner.done     { background: #0d2218; border-color: #166534; color: #4ade80; }
+.scan-banner .spin    { display: inline-block; animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.scan-banner .f5-hint { margin-left: auto; font-size: .7rem; color: #475569; font-weight: 400; }
+
+/* ---- State msg ---- */
+.state-msg { text-align: center; padding: 60px 20px; color: #475569; font-size: .9rem; }
+.state-msg strong { display: block; font-size: 1.5rem; margin-bottom: 10px; color: #64748b; }
+
+/* ---- Table ---- */
+.table-wrap { overflow-x: auto; border-radius: 12px; border: 1px solid #2d3148; background: #1a1d27; }
+table { width: 100%; border-collapse: collapse; }
+thead tr { background: #141720; }
+th { padding: 10px 14px; text-align: left; font-size: .65rem; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: .6px; border-bottom: 1px solid #2d3148; white-space: nowrap; }
+td { padding: 9px 14px; font-size: .82rem; color: #cbd5e1; border-bottom: 1px solid #1e2233; vertical-align: middle; }
+tbody tr:last-child td { border-bottom: none; }
+tbody tr:hover { background: #1f2235; }
+.row-hidden { display: none; }
+
+/* ---- Cells ---- */
+.cell-ip { font-family: "Cascadia Code", Consolas, monospace; color: #38bdf8; font-size: .8rem; text-decoration: none; }
+.cell-ip:hover { text-decoration: underline; color: #7dd3fc; }
+.probe-lnk { font-size: .75rem; margin-left: 5px; text-decoration: none; opacity: .25; transition: opacity .15s; }
+.probe-lnk:hover { opacity: 1; }
+.cell-modelo { font-size: .78rem; color: #94a3b8; max-width: 180px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cell-modelo.na { color: #374151; font-style: italic; }
+.badge-mfr { display: inline-block; padding: 2px 9px; border-radius: 6px; font-size: .7rem; font-weight: 700; border: 1px solid; white-space: nowrap; }
+.mfr-hp        { background: #0c2044; color: #60a5fa; border-color: #1e3a6e; }
+.mfr-samsung   { background: #0a1f3a; color: #38bdf8; border-color: #164e7a; }
+.mfr-zebra     { background: #1a1208; color: #fbbf24; border-color: #5a3e08; }
+.mfr-honeywell { background: #1a0a0a; color: #f87171; border-color: #5a1414; }
+.mfr-desconhecido { background: #1e1e2e; color: #94a3b8; border-color: #374151; }
+.cell-mono { font-family: "Cascadia Code", Consolas, monospace; font-size: .78rem; }
+.cell-mono.na { color: #374151; font-style: italic; }
+.v-pages { color: #34d399; font-weight: 600; }
+.v-odom  { color: #fbbf24; font-weight: 600; }
+.v-toner { font-weight: 600; }
+.v-ok    { color: #4ade80; }
+.v-warn  { color: #fbbf24; }
+.v-crit  { color: #f87171; }
+.tipo-badge { font-size: .65rem; font-weight: 700; padding: 1px 7px; border-radius: 5px; border: 1px solid; text-transform: uppercase; }
+.tipo-laser   { background: #1a2a4a; color: #60a5fa; border-color: #2d4a8a; }
+.tipo-termica { background: #2a1f0a; color: #fbbf24; border-color: #7c5a0a; }
+.status-online { display: inline-flex; align-items: center; gap: 5px; font-size: .75rem; font-weight: 600; color: #4ade80; }
+.status-online::before { content: ""; width: 6px; height: 6px; background: #4ade80; border-radius: 50%; box-shadow: 0 0 6px #4ade80; }
+.ts-cell { font-size: .68rem; color: #475569; white-space: nowrap; }
+</style>
+</head>
+<body>
+
+<!-- ======= SIDEBAR ======= -->
+<aside class="sidebar">
+  <div class="sidebar-header">
+    <h2>&#128424; Impressoras</h2>
+    <div class="ts">$TIMESTAMP</div>
+  </div>
+  <div class="sidebar-search">
+    <input type="text" id="cd-search" placeholder="Buscar CD..." oninput="filterCdList()">
+  </div>
+  <div class="cd-list" id="cd-list"></div>
+  <div class="sidebar-footer">
+    <a href="http://127.0.0.1:$PROBE_PORT/probe" target="_blank">&#128269; Probe de Conectividade</a>
+    <button onclick="showAll()">Ver todos os CDs</button>
+  </div>
+</aside>
+
+<!-- ======= MAIN ======= -->
+<main class="main">
+  <div class="topbar">
+    <h1 id="main-title">&#128424; Selecione um CD</h1>
+    <span class="ts-badge">Invent&aacute;rio: $TIMESTAMP</span>
+  </div>
+
+  <div id="scan-banner" class="scan-banner running" style="display:none">
+    <span class="spin">&#8635;</span>
+    <span id="scan-msg">Verificando status do scan...</span>
+    <span class="f5-hint">Pressione F5 para atualizar os dados</span>
+  </div>
+
+  <div class="stats-bar" id="stats-bar" style="display:none">
+    <div class="stat-card"><div class="stat-label">Total</div><div class="stat-value" id="st-total">0</div></div>
+    <div class="stat-card"><div class="stat-label">Laser</div><div class="stat-value blue" id="st-laser">0</div></div>
+    <div class="stat-card"><div class="stat-label">T&eacute;rmica</div><div class="stat-value amber" id="st-termica">0</div></div>
+  </div>
+
+  <div class="filters-bar" id="filters-bar" style="display:none">
+    <div class="filter-group">
+      <label>IP</label>
+      <input type="text" id="f-ip" class="filter-input" placeholder="Ex: 10.0.1" oninput="applyFilters()">
+    </div>
+    <div class="filter-group">
+      <label>Fabricante</label>
+      <select id="f-fab" class="filter-select" onchange="applyFilters()">
+        <option value="">Todos</option>
+        <option value="HP">HP</option>
+        <option value="Samsung">Samsung</option>
+        <option value="Zebra">Zebra</option>
+        <option value="Honeywell">Honeywell</option>
+      </select>
+    </div>
+    <div class="filter-group">
+      <label>Tipo</label>
+      <select id="f-tipo" class="filter-select" onchange="applyFilters()">
+        <option value="">Todos</option>
+        <option value="laser">Laser</option>
+        <option value="termica">T&eacute;rmica</option>
+      </select>
+    </div>
+    <div class="filter-group">
+      <label>Serial / Modelo</label>
+      <input type="text" id="f-serial" class="filter-input" placeholder="Buscar..." oninput="applyFilters()">
+    </div>
+    <button class="btn-clear" onclick="clearFilters()">&#10005; Limpar</button>
+    <span class="visible-count" id="visible-count"></span>
+  </div>
+
+  <div id="content">
+    <div class="state-msg">
+      <strong>&#128424;</strong>
+      Selecione um CD na barra lateral para visualizar as impressoras.
+    </div>
+  </div>
+</main>
+
+<script>
+'use strict';
+const ALL_PRINTERS = $DATA;
+const ALL_CDS      = $CDS;
+const PROBE_BASE   = 'http://127.0.0.1:$PROBE_PORT';
+
+// Índice por CD
+var BY_CD = {};
+ALL_PRINTERS.forEach(function(p) {
+  var cd = String(p.filial || '');
+  if (!BY_CD[cd]) BY_CD[cd] = [];
+  BY_CD[cd].push(p);
+});
+
+function esc(s) {
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function fmt(v) {
+  return (v && v !== 'N/A' && v !== 'None' && v !== 'null') ? v : null;
+}
+function fmtDate(iso) {
+  if (!iso) return '—';
+  try {
+    var d = new Date(iso);
+    return isNaN(d) ? iso : d.toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'});
+  } catch(e) { return iso; }
+}
+function tonerClass(val) {
+  var m = String(val||'').match(/(\d+)/);
+  if (!m) return 'v-toner';
+  var p = parseInt(m[1]);
+  return 'v-toner ' + (p >= 30 ? 'v-ok' : p >= 15 ? 'v-warn' : 'v-crit');
+}
+
+// ---- Sidebar -------------------------------------------------------
+function buildCdList() {
+  var list = document.getElementById('cd-list');
+  list.innerHTML = '';
+  ALL_CDS.forEach(function(cd) {
+    var el = document.createElement('div');
+    el.className = 'cd-item';
+    el.dataset.cd = cd;
+    el.onclick = function() { selectCd(cd); };
+    el.innerHTML =
+      '<span class="cd-num">CD ' + esc(cd) + '</span>' +
+      '<span class="cd-cnt">' + ((BY_CD[cd]||[]).length) + '</span>';
+    list.appendChild(el);
+  });
+}
+
+function filterCdList() {
+  var q = document.getElementById('cd-search').value.trim().toLowerCase();
+  document.querySelectorAll('.cd-item').forEach(function(el) {
+    el.classList.toggle('cd-hidden', !!(q && el.dataset.cd.toLowerCase().indexOf(q) === -1));
+  });
+}
+
+function selectCd(cd) {
+  document.querySelectorAll('.cd-item').forEach(function(el) {
+    el.classList.toggle('active', el.dataset.cd === cd);
+  });
+  document.getElementById('main-title').textContent = '\uD83D\uDDE8 CD ' + cd;
+  document.getElementById('stats-bar').style.display   = 'flex';
+  document.getElementById('filters-bar').style.display = 'flex';
+  clearFilters(false);
+  var printers = BY_CD[cd] || [];
+  renderTable(printers);
+  updateStats(printers);
+}
+
+function showAll() {
+  document.querySelectorAll('.cd-item').forEach(function(el) { el.classList.remove('active'); });
+  document.getElementById('main-title').textContent = '\uD83D\uDDE8 Todos os CDs';
+  document.getElementById('stats-bar').style.display   = 'flex';
+  document.getElementById('filters-bar').style.display = 'flex';
+  clearFilters(false);
+  renderTable(ALL_PRINTERS);
+  updateStats(ALL_PRINTERS);
+}
+
+// ---- Table ---------------------------------------------------------
+function renderTable(printers) {
+  if (!printers || printers.length === 0) {
+    document.getElementById('content').innerHTML =
+      '<div class="state-msg"><strong>0</strong>Nenhuma impressora encontrada.</div>';
+    document.getElementById('visible-count').textContent = '';
+    return;
+  }
+  var rows = printers.map(makeRow).join('');
+  document.getElementById('content').innerHTML =
+    '<div class="table-wrap"><table>' +
+    '<thead><tr>' +
+      '<th>IP</th><th>Fabricante</th><th>Modelo</th><th>N.\u00ba S\u00e9rie</th>' +
+      '<th>Contador / Od\u00f4m.</th><th>Toner</th><th>Kit / Drum</th>' +
+      '<th>Tipo</th><th>Status</th><th>Atualizado</th>' +
+    '</tr></thead>' +
+    '<tbody>' + rows + '</tbody></table></div>';
+  document.getElementById('visible-count').textContent = printers.length + ' impressora(s)';
+}
+
+function makeRow(p) {
+  var mfrCls    = 'mfr-' + (p.fabricante||'').toLowerCase();
+  var tipoClass = p.tipo === 'laser' ? 'tipo-laser' : 'tipo-termica';
+  var tipoLabel = p.tipo === 'laser' ? 'Laser' : 'T\u00e9rmica';
+
+  var metVal  = fmt(p.metrica);
+  var isOdom  = metVal && String(metVal).indexOf('pol.') !== -1;
+  var metHtml = metVal
+    ? '<span class="cell-mono ' + (isOdom ? 'v-odom' : 'v-pages') + '">' + esc(metVal) + '</span>'
+    : '<span class="cell-mono na">\u2014</span>';
+
+  var tonerVal  = fmt(p.toner);
+  var tonerHtml = tonerVal
+    ? '<span class="cell-mono ' + tonerClass(tonerVal) + '">' + esc(tonerVal) + '</span>'
+    : '<span class="cell-mono na">\u2014</span>';
+
+  var c2Val  = fmt(p.consumivel2);
+  var c2Html = c2Val
+    ? '<span class="cell-mono ' + tonerClass(c2Val) + '">' + esc(c2Val) + '</span>'
+    : '<span class="cell-mono na">\u2014</span>';
+
+  var modelVal  = fmt(p.modelo);
+  var modelHtml = modelVal
+    ? '<span class="cell-modelo" title="' + esc(modelVal) + '">' + esc(modelVal) + '</span>'
+    : '<span class="cell-modelo na">\u2014</span>';
+
+  var serialVal  = fmt(p.serial);
+  var serialHtml = serialVal
+    ? '<span class="cell-mono">' + esc(serialVal) + '</span>'
+    : '<span class="cell-mono na">\u2014</span>';
+
+  return '<tr data-ip="' + esc(p.ip) + '" data-fab="' + esc(p.fabricante||'') + '" ' +
+         'data-tipo="' + esc(p.tipo||'') + '" ' +
+         'data-serial="' + esc((p.serial||'').toLowerCase()) + '" ' +
+         'data-modelo="' + esc((p.modelo||'').toLowerCase()) + '">' +
+    '<td>' +
+      '<a href="http://' + esc(p.ip) + '/" target="_blank" class="cell-ip" title="Abrir interface web">' + esc(p.ip) + '</a>' +
+      '<a href="' + esc(PROBE_BASE) + '/probe?ip=' + esc(p.ip) + '" target="_blank" class="probe-lnk" title="Probe">&#128269;</a>' +
+    '</td>' +
+    '<td><span class="badge-mfr ' + mfrCls + '">' + esc(p.fabricante||'') + '</span></td>' +
+    '<td>' + modelHtml + '</td>' +
+    '<td>' + serialHtml + '</td>' +
+    '<td>' + metHtml + '</td>' +
+    '<td>' + tonerHtml + '</td>' +
+    '<td>' + c2Html + '</td>' +
+    '<td><span class="tipo-badge ' + tipoClass + '">' + tipoLabel + '</span></td>' +
+    '<td><span class="status-online">Online</span></td>' +
+    '<td class="ts-cell">' + esc(fmtDate(p.last_updated)) + '</td>' +
+  '</tr>';
+}
+
+function updateStats(printers) {
+  var laser   = printers.filter(function(p){return p.tipo==='laser';}).length;
+  var termica = printers.filter(function(p){return p.tipo==='termica';}).length;
+  document.getElementById('st-total').textContent   = printers.length;
+  document.getElementById('st-laser').textContent   = laser;
+  document.getElementById('st-termica').textContent = termica;
+}
+
+// ---- Filters -------------------------------------------------------
+function applyFilters() {
+  var fIp     = document.getElementById('f-ip').value.trim().toLowerCase();
+  var fFab    = document.getElementById('f-fab').value;
+  var fTipo   = document.getElementById('f-tipo').value;
+  var fSerial = document.getElementById('f-serial').value.trim().toLowerCase();
+  var vis = 0;
+  document.querySelectorAll('#content tbody tr').forEach(function(tr) {
+    var show = true;
+    if (fIp     && tr.dataset.ip.toLowerCase().indexOf(fIp) === -1)           show = false;
+    if (fFab    && tr.dataset.fab !== fFab)                                    show = false;
+    if (fTipo   && tr.dataset.tipo !== fTipo)                                  show = false;
+    if (fSerial && tr.dataset.serial.indexOf(fSerial) === -1
+                && tr.dataset.modelo.indexOf(fSerial) === -1)                  show = false;
+    tr.classList.toggle('row-hidden', !show);
+    if (show) vis++;
+  });
+  document.getElementById('visible-count').textContent = vis + ' impressora(s)';
+}
+
+function clearFilters(refilter) {
+  ['f-ip','f-serial'].forEach(function(id){document.getElementById(id).value='';});
+  document.getElementById('f-fab').value  = '';
+  document.getElementById('f-tipo').value = '';
+  if (refilter !== false) applyFilters();
+}
+
+// ---- Init ----------------------------------------------------------
+buildCdList();
+if (ALL_CDS.length === 1) selectCd(ALL_CDS[0]);
+
+// ---- Scan status polling -------------------------------------------
+var _autoRefreshTimer = null;
+
+function _scheduleAutoRefresh() {
+  if (_autoRefreshTimer) clearTimeout(_autoRefreshTimer);
+  // Recarrega a página a cada 20s enquanto scan está rodando
+  _autoRefreshTimer = setTimeout(function() { location.reload(); }, 20000);
+}
+
+function _pollStatus() {
+  fetch('/api/status')
+    .then(function(r) { return r.json(); })
+    .then(function(s) {
+      var banner = document.getElementById('scan-banner');
+      var msg    = document.getElementById('scan-msg');
+      if (s.running) {
+        var pct = s.networks_total > 0
+          ? Math.round(s.networks_done / s.networks_total * 100) + '%'
+          : '...';
+        msg.textContent = 'Escaneando redes — '
+          + s.networks_done + '/' + s.networks_total + ' redes (' + pct + ') — '
+          + s.total + ' impressora(s) encontrada(s)';
+        banner.className = 'scan-banner running';
+        banner.style.display = 'flex';
+        _scheduleAutoRefresh();
+        setTimeout(_pollStatus, 5000);
+      } else if (s.total > 0) {
+        if (_autoRefreshTimer) { clearTimeout(_autoRefreshTimer); _autoRefreshTimer = null; }
+        // Se acabou de terminar (finished_at recente, menos de 30s atrás)
+        var finished = s.finished_at ? new Date(s.finished_at) : null;
+        var justDone = finished && (Date.now() - finished.getTime() < 30000);
+        if (justDone) {
+          msg.textContent = 'Scan conclu\u00eddo \u2014 ' + s.total + ' impressora(s) encontrada(s). Recarregando...';
+          banner.className = 'scan-banner done';
+          banner.style.display = 'flex';
+          setTimeout(function() { location.reload(); }, 1500);
+        } else {
+          banner.style.display = 'none';
+        }
+      } else {
+        banner.style.display = 'none';
+      }
+    })
+    .catch(function() { /* servidor pode não ter /api/status */ });
+}
+
+_pollStatus();
+</script>
+</body>
+</html>
+
