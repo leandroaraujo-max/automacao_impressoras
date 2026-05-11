@@ -109,6 +109,26 @@ ZEBRA_DEFAULT_DPI     = 203
 # Honeywell/Intermec
 OID_HONEYWELL_MODEL   = '1.3.6.1.4.1.1248.1.1.3.1.3.0'  # Honeywell model
 
+# ---- OIDs de configuracao de rede (HP JetDirect MIB) ----------------------
+OID_HP_HOSTNAME       = '1.3.6.1.4.1.11.2.4.3.5.2.0'    # hostname
+OID_HP_DNS_PRIMARY    = '1.3.6.1.4.1.11.2.4.3.5.29.0'   # DNS primario
+OID_HP_DNS_SECONDARY  = '1.3.6.1.4.1.11.2.4.3.5.30.0'   # DNS secundario
+OID_HP_GATEWAY        = '1.3.6.1.4.1.11.2.4.3.5.20.0'   # gateway padrao
+OID_HP_IP_CONFIG      = '1.3.6.1.4.1.11.2.4.3.5.16.0'   # modo IP (1=DHCP, 2=Manual)
+OID_STD_HOSTNAME      = '1.3.6.1.2.1.1.5.0'              # RFC 1213 sysName
+
+# ---- Credenciais para aplicacao de DNS ------------------------------------
+# HP — SNMP SET (community de escrita)
+SNMP_WRITE_COMMUNITY  = 'public'
+
+# HP — EWS HTTP Basic Auth
+HP_EWS_USER     = 'administrador'
+HP_EWS_PASSWORD = 'simpress1934@'
+
+# Samsung SyncThru HTTP
+SAMSUNG_USER     = 'admin'
+SAMSUNG_PASSWORDS = ['sec00000', '1111', 'simpress1934@']
+
 # ---- Classificação de fabricantes -----------------------------------------
 KNOWN_MANUFACTURERS   = frozenset({'HP', 'Samsung', 'Zebra', 'Honeywell'})
 LASER_MANUFACTURERS   = frozenset({'HP', 'Samsung'})
@@ -168,6 +188,13 @@ class PrinterInfo:
     tipo:         str            # 'laser' | 'termica' (corrigido pelo fabricante)
     first_seen:   str            # ISO datetime do primeiro scan
     last_updated: str            # ISO datetime da última atualização de métrica
+    # Configuração de rede
+    hostname:     Optional[str] = None
+    dns1:         Optional[str] = None
+    dns2:         Optional[str] = None
+    gateway:      Optional[str] = None
+    ip_mode:      Optional[str] = None   # 'DHCP' | 'Manual' | 'AutoIP'
+    dns_apply_status: Optional[str] = None  # resultado da última aplicação de DNS
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -376,6 +403,263 @@ def _http_get_page(ip: str, path: str, use_https: bool = False,
                 return resp.read(65536).decode('utf-8', errors='ignore')
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Configuração de rede (DNS, Gateway, Hostname)
+# ---------------------------------------------------------------------------
+
+def get_network_config(ip: str, manufacturer: str) -> dict:
+    """Coleta hostname, DNS1, DNS2, gateway e modo IP do equipamento.
+
+    HP   → HP JetDirect SNMP MIB (OIDs 1.3.6.1.4.1.11.2.4.3.5.*)
+         fallback → EWS /DevMgmt/NetworkConfigDyn.json
+    Samsung → SyncThru /sws/app/information/network/networkSetting.json
+    """
+    import re
+    result = {'hostname': None, 'dns1': None, 'dns2': None,
+              'gateway': None, 'ip_mode': None}
+
+    if manufacturer == 'HP':
+        # --- SNMP JetDirect (mais confiável) ---
+        hn  = _snmp_get(ip, OID_HP_HOSTNAME) or _snmp_get(ip, OID_STD_HOSTNAME)
+        d1  = _snmp_get(ip, OID_HP_DNS_PRIMARY)
+        d2  = _snmp_get(ip, OID_HP_DNS_SECONDARY)
+        gw  = _snmp_get(ip, OID_HP_GATEWAY)
+        raw_mode = _snmp_get(ip, OID_HP_IP_CONFIG)
+        mode_map = {'1': 'BOOTP', '2': 'DHCP', '3': 'Manual', '4': 'AutoIP'}
+        if raw_mode and raw_mode.isdigit():
+            ip_mode = mode_map.get(raw_mode, f'Código {raw_mode}')
+        else:
+            ip_mode = raw_mode
+
+        result = {'hostname': hn, 'dns1': d1 or None, 'dns2': d2 or None,
+                  'gateway': gw, 'ip_mode': ip_mode}
+
+        # --- Fallback HTTP EWS JSON (impressoras modernas sem JetDirect MIB) ---
+        if not d1:
+            for use_https in (True, False):
+                body = _http_get_page(ip, '/DevMgmt/NetworkConfigDyn.json',
+                                      use_https=use_https)
+                if not body:
+                    continue
+                try:
+                    import json as _json
+                    data = _json.loads(body)
+                    def _deep(d, *keys):
+                        for k in keys:
+                            if isinstance(d, dict):
+                                d = d.get(k)
+                            else:
+                                return None
+                        return d
+                    dns_cfg = _deep(data, 'NetworkConfigDyn', 'IPConfiguration',
+                                    'DNS')
+                    if dns_cfg:
+                        result['dns1']    = dns_cfg.get('PreferredServer') or result['dns1']
+                        result['dns2']    = dns_cfg.get('AlternateServer')  or result['dns2']
+                    gw_cfg = _deep(data, 'NetworkConfigDyn', 'IPConfiguration', 'DefaultGateway')
+                    if gw_cfg:
+                        result['gateway'] = gw_cfg or result['gateway']
+                    break
+                except Exception:
+                    pass
+
+    elif manufacturer == 'Samsung':
+        # --- SyncThru JSON ---
+        for path in (
+            '/sws/app/information/network/networkSetting.json',
+            '/sws/swsapi/swsconfig?subtype=networkSetting',
+        ):
+            body = _http_get_page(ip, path)
+            if not body:
+                continue
+            try:
+                import json as _json
+                data = _json.loads(body)
+                # Estrutura varia por firmware; busca recursiva por campos comuns
+                flat = json.dumps(data)  # noqa: F821 (json importado no outer scope)
+                dns1_m = re.search(r'(?:primaryDns|dns1|preferredDns)["\s:]+([\d.]{7,15})', flat, re.I)
+                dns2_m = re.search(r'(?:secondaryDns|dns2|alternateDns)["\s:]+([\d.]{7,15})', flat, re.I)
+                gw_m   = re.search(r'(?:gateway|defaultGateway)["\s:]+([\d.]{7,15})', flat, re.I)
+                hn_m   = re.search(r'(?:hostName|hostname)["\s:]+"([^"]{2,80})"', flat, re.I)
+                dhcp_m = re.search(r'(?:dhcp|ipMode|ipMethod)["\s:]+"?([\w]+)"?', flat, re.I)
+                if dns1_m:
+                    result['dns1']     = dns1_m.group(1)
+                    result['dns2']     = dns2_m.group(1) if dns2_m else None
+                    result['gateway']  = gw_m.group(1)   if gw_m   else None
+                    result['hostname'] = hn_m.group(1)   if hn_m   else None
+                    if dhcp_m:
+                        v = dhcp_m.group(1).upper()
+                        result['ip_mode'] = 'DHCP' if 'DHCP' in v or v == 'TRUE' else 'Manual'
+                    break
+            except Exception:
+                pass
+
+    # Limpa strings vazias / zero IPs
+    for k in ('dns1', 'dns2', 'gateway'):
+        v = result.get(k)
+        if v in (None, '', '0.0.0.0', '0'):
+            result[k] = None
+
+    log.debug(f'[netcfg] {ip} → {result}')
+    return result
+
+
+def _snmp_set_string(ip: str, oid: str, value: str) -> bool:
+    """SNMP SET OctetString usando community de escrita. Retorna True se OK."""
+    # BER helpers
+    def _bl(n):
+        if n < 128:  return bytes([n])
+        if n < 256:  return b'\x81' + bytes([n])
+        return b'\x82' + bytes([(n >> 8) & 0xff, n & 0xff])
+    def _tlv(t, v):  return bytes([t]) + _bl(len(v)) + v
+    def _bi(n):
+        if n == 0:  return _tlv(0x02, b'\x00')
+        buf = []; m = n
+        while m:  buf.append(m & 0xff); m >>= 8
+        buf.reverse()
+        if buf[0] & 0x80:  buf.insert(0, 0)
+        return _tlv(0x02, bytes(buf))
+    def _boid(s):
+        p = [int(x) for x in s.strip('.').split('.')]
+        r = [p[0] * 40 + p[1]]
+        for v in p[2:]:
+            if v == 0:  r.append(0)
+            else:
+                b = []; x = v
+                while x:  b.append(x & 0x7f); x >>= 7
+                b.reverse()
+                for i in range(len(b) - 1):  b[i] |= 0x80
+                r.extend(b)
+        return _tlv(0x06, bytes(r))
+
+    vb  = _tlv(0x30, _boid(oid) + _tlv(0x04, value.encode()))
+    pdu = _tlv(0xa3, _bi(2) + _bi(0) + _bi(0) + _tlv(0x30, vb))  # 0xa3 = SetRequest
+    pkt = _tlv(0x30, _bi(0) + _tlv(0x04, SNMP_WRITE_COMMUNITY.encode()) + pdu)
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(SNMP_TIMEOUT)
+            s.sendto(pkt, (ip, 161))
+            resp, _ = s.recvfrom(1024)
+        # Verifica se recebeu SetResponse (0xa2) sem erro
+        return len(resp) > 6 and resp[0] == 0x30
+    except Exception as e:
+        log.debug(f'[snmp_set] {ip} OID={oid} erro: {e}')
+        return False
+
+
+def _http_post_authenticated(ip: str, path: str, payload: str,
+                              user: str, password: str,
+                              content_type: str = 'application/x-www-form-urlencoded',
+                              use_https: bool = False) -> Optional[str]:
+    """POST HTTP com autenticação Basic."""
+    import base64, ssl
+    scheme = 'https' if use_https else 'http'
+    url = f'{scheme}://{ip}{path}'
+    creds = base64.b64encode(f'{user}:{password}'.encode()).decode()
+    try:
+        req = urllib.request.Request(
+            url,
+            data=payload.encode(),
+            headers={
+                'Authorization': f'Basic {creds}',
+                'Content-Type':  content_type,
+                'User-Agent':    'PrinterScanner/1.0',
+            },
+            method='POST',
+        )
+        if use_https:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=ctx) as r:
+                return r.read(4096).decode('utf-8', errors='ignore')
+        else:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+                return r.read(4096).decode('utf-8', errors='ignore')
+    except Exception as e:
+        log.debug(f'[http_post] {ip}{path} erro: {e}')
+        return None
+
+
+def apply_dns_config(ip: str, manufacturer: str,
+                     dns1: str, dns2: str) -> dict:
+    """Aplica DNS primário e secundário no equipamento.
+
+    HP:
+      1. SNMP SET JetDirect (OIDs 29/30) — mais universal
+      2. Fallback EWS HTTP POST /hp/device/IPConfiguration/SetStaticDNS
+    Samsung:
+      1. HTTP POST SyncThru /sws/swsapi/swsconfig?subtype=networkSetting
+         com credenciais (tenta todas as senhas conhecidas)
+
+    Retorna dict {'ok': bool, 'method': str, 'detail': str}
+    """
+    result = {'ok': False, 'method': '', 'detail': ''}
+
+    if manufacturer == 'HP':
+        # --- Tentativa 1: SNMP SET ---
+        ok1 = _snmp_set_string(ip, OID_HP_DNS_PRIMARY,   dns1)
+        ok2 = _snmp_set_string(ip, OID_HP_DNS_SECONDARY, dns2)
+        if ok1 or ok2:
+            result = {'ok': True, 'method': 'SNMP SET JetDirect',
+                      'detail': f'DNS1={dns1} DNS2={dns2} (SNMP ok1={ok1} ok2={ok2})'}
+            log.info(f'[apply_dns] {ip} HP SNMP SET ok: {dns1}/{dns2}')
+            return result
+
+        # --- Tentativa 2: EWS HTTP (com e sem HTTPS) ---
+        import urllib.parse
+        for use_https in (True, False):
+            # Endpoint para impressoras HP modernas
+            payload = urllib.parse.urlencode({
+                'PreferredDNSServer':  dns1,
+                'AlternateDNSServer':  dns2,
+            })
+            resp = _http_post_authenticated(
+                ip, '/hp/device/IPConfiguration/SetStaticDNS',
+                payload, HP_EWS_USER, HP_EWS_PASSWORD, use_https=use_https)
+            if resp is not None:
+                result = {'ok': True, 'method': f'EWS HTTP{"S" if use_https else ""}',
+                          'detail': f'DNS1={dns1} DNS2={dns2}'}
+                log.info(f'[apply_dns] {ip} HP EWS HTTP ok: {dns1}/{dns2}')
+                return result
+
+        result['detail'] = 'SNMP SET sem resposta e EWS HTTP sem resposta — verifique community de escrita e senha EWS'
+
+    elif manufacturer == 'Samsung':
+        import json as _json, urllib.parse
+        payload_dict = {
+            'networkSetting': {
+                'tcpip': {'dns': {'primaryDns': dns1, 'secondaryDns': dns2}}
+            }
+        }
+        payload_json = _json.dumps(payload_dict)
+        for password in SAMSUNG_PASSWORDS:
+            # SyncThru aceita JSON via PUT ou POST dependendo do firmware
+            for method_path in (
+                '/sws/swsapi/swsconfig?subtype=networkSetting',
+                '/sws/app/information/network/networkSetting',
+            ):
+                resp = _http_post_authenticated(
+                    ip, method_path, payload_json,
+                    SAMSUNG_USER, password,
+                    content_type='application/json')
+                if resp is not None and ('ok' in resp.lower() or 'success' in resp.lower()
+                                         or 'true' in resp.lower()):
+                    result = {'ok': True, 'method': 'SyncThru HTTP POST',
+                              'detail': f'DNS1={dns1} DNS2={dns2} senha={password[:3]}***'}
+                    log.info(f'[apply_dns] {ip} Samsung SyncThru ok: {dns1}/{dns2}')
+                    return result
+        result['detail'] = ('SyncThru sem confirmação — verifique se o payload '  
+                            'foi aceito manualmente em http://' + ip + '/sws')
+
+    else:
+        result['detail'] = f'Fabricante {manufacturer!r} sem suporte a apply_dns automatizado'
+
+    log.warning(f'[apply_dns] {ip} FALHOU: {result["detail"]}')
+    return result
 
 
 def get_page_count(ip: str) -> Optional[str]:
@@ -769,6 +1053,15 @@ def update_metrics_from_cache(cached: dict) -> dict:
     else:
         updated['metrica'] = get_page_count(ip)
 
+    # Atualiza configuração de rede (sempre que for HP ou Samsung)
+    if mfr in ('HP', 'Samsung'):
+        netcfg = get_network_config(ip, mfr)
+        updated['hostname'] = netcfg.get('hostname') or updated.get('hostname')
+        updated['dns1']     = netcfg.get('dns1')     or updated.get('dns1')
+        updated['dns2']     = netcfg.get('dns2')     or updated.get('dns2')
+        updated['gateway']  = netcfg.get('gateway')  or updated.get('gateway')
+        updated['ip_mode']  = netcfg.get('ip_mode')  or updated.get('ip_mode')
+
     updated['last_updated'] = now
     return updated
 
@@ -1070,6 +1363,11 @@ def scan_network(entry: dict, known_ips: set[str]) -> list[dict]:
                 else:  # Honeywell
                     metrica = get_page_count(host)
 
+                # Coleta configuração de rede (DNS, Gateway, Hostname)
+                netcfg = {}
+                if manufacturer in ('HP', 'Samsung'):
+                    netcfg = get_network_config(host, manufacturer)
+
                 printer = PrinterInfo(
                     ip=host,
                     fabricante=manufacturer,
@@ -1083,6 +1381,11 @@ def scan_network(entry: dict, known_ips: set[str]) -> list[dict]:
                     tipo=tipo_real,
                     first_seen=now,
                     last_updated=now,
+                    hostname=netcfg.get('hostname'),
+                    dns1=netcfg.get('dns1'),
+                    dns2=netcfg.get('dns2'),
+                    gateway=netcfg.get('gateway'),
+                    ip_mode=netcfg.get('ip_mode'),
                 ).to_dict()
 
                 log.info(
@@ -1273,6 +1576,150 @@ def _register_routes(flask_app, req, jsonify_fn, render_tmpl):
     @flask_app.route('/probe')
     def probe_page():
         return render_tmpl('probe.html')
+
+    @flask_app.route('/api/network-report')
+    def api_network_report():
+        """Relatório de configuração de rede de todas as impressoras do cache.
+        Parâmetros opcionais:
+          ?dns1=X.X.X.X  — filtra/compara com DNS primário alvo
+          ?dns2=X.X.X.X  — filtra/compara com DNS secundário alvo
+        """
+        target_dns1 = req.args.get('dns1', '').strip() or None
+        target_dns2 = req.args.get('dns2', '').strip() or None
+        cache = load_cache()
+        report = []
+        for p in cache.values():
+            mfr = p.get('fabricante', '')
+            if mfr not in ('HP', 'Samsung'):
+                continue
+            dns1_ok = (p.get('dns1') == target_dns1) if target_dns1 else None
+            dns2_ok = (p.get('dns2') == target_dns2) if target_dns2 else None
+            needs_update = (
+                (target_dns1 and not dns1_ok) or
+                (target_dns2 and not dns2_ok)
+            ) if (target_dns1 or target_dns2) else None
+            report.append({
+                'ip':           p.get('ip'),
+                'fabricante':   mfr,
+                'modelo':       p.get('modelo'),
+                'filial':       p.get('filial'),
+                'hostname':     p.get('hostname'),
+                'dns1':         p.get('dns1'),
+                'dns2':         p.get('dns2'),
+                'gateway':      p.get('gateway'),
+                'ip_mode':      p.get('ip_mode'),
+                'dns1_ok':      dns1_ok,
+                'dns2_ok':      dns2_ok,
+                'needs_update': needs_update,
+                'last_updated': p.get('last_updated'),
+                'dns_apply_status': p.get('dns_apply_status'),
+            })
+        # Ordena: com problema primeiro, depois por filial
+        report.sort(key=lambda r: (
+            0 if r['needs_update'] else 1,
+            str(r.get('filial', '')).zfill(6),
+            r.get('ip', ''),
+        ))
+        needs_count = sum(1 for r in report if r.get('needs_update'))
+        return jsonify_fn({
+            'total':        len(report),
+            'needs_update': needs_count,
+            'target_dns1':  target_dns1,
+            'target_dns2':  target_dns2,
+            'printers':     report,
+        })
+
+    @flask_app.route('/api/apply-dns', methods=['POST'])
+    def api_apply_dns():
+        """Aplica DNS em uma ou mais impressoras.
+
+        Body JSON:
+          { "dns1": "X.X.X.X", "dns2": "X.X.X.X",
+            "ips": ["X.X.X.X", ...] }   -- lista específica, OU
+          { "dns1": "X.X.X.X", "dns2": "X.X.X.X",
+            "all_pending": true,
+            "target_dns1": "...", "target_dns2": "..." }  -- todos com DNS divergente
+        """
+        import json as _json
+        try:
+            body = _json.loads(req.get_data(as_text=True) or '{}')
+        except Exception:
+            return jsonify_fn({'error': 'JSON inválido'}), 400
+
+        dns1 = body.get('dns1', '').strip()
+        dns2 = body.get('dns2', '').strip()
+        if not dns1:
+            return jsonify_fn({'error': 'Campo dns1 obrigatório'}), 400
+
+        cache = load_cache()
+
+        # Determina lista de IPs alvo
+        if body.get('all_pending'):
+            t1 = body.get('target_dns1', dns1).strip()
+            t2 = body.get('target_dns2', dns2).strip()
+            target_ips = [
+                p['ip'] for p in cache.values()
+                if p.get('fabricante') in ('HP', 'Samsung') and (
+                    (t1 and p.get('dns1') != t1) or
+                    (t2 and p.get('dns2') != t2)
+                )
+            ]
+        else:
+            target_ips = [i.strip() for i in body.get('ips', []) if i.strip()]
+
+        if not target_ips:
+            return jsonify_fn({'message': 'Nenhum equipamento para atualizar', 'results': []}), 200
+
+        results = []
+        lock_apply = threading.Lock()
+
+        def _apply_worker(ip: str) -> None:
+            p = cache.get(ip)
+            if not p:
+                with lock_apply:
+                    results.append({'ip': ip, 'ok': False,
+                                    'detail': 'IP não encontrado no cache'})
+                return
+            mfr = p.get('fabricante', '')
+            if mfr not in ('HP', 'Samsung'):
+                with lock_apply:
+                    results.append({'ip': ip, 'ok': False,
+                                    'detail': f'Fabricante {mfr!r} sem suporte'})
+                return
+            r = apply_dns_config(ip, mfr, dns1, dns2)
+            # Persiste status no cache
+            if r['ok']:
+                p['dns1'] = dns1
+                p['dns2'] = dns2
+                p['dns_apply_status'] = f'OK {datetime.now().strftime("%d/%m %H:%M")} — {r["method"]}'
+            else:
+                p['dns_apply_status'] = f'FALHA {datetime.now().strftime("%d/%m %H:%M")} — {r["detail"][:80]}'
+            cache[ip] = p
+            with lock_apply:
+                results.append({'ip': ip, 'fabricante': mfr,
+                                 'ok': r['ok'], 'method': r.get('method', ''),
+                                 'detail': r.get('detail', '')})
+
+        threads = [threading.Thread(target=_apply_worker, args=(ip,), daemon=True)
+                   for ip in target_ips]
+        for t in threads: t.start()
+        for t in threads: t.join()
+
+        # Salva cache com status atualizado
+        save_cache(list(cache.values()))
+
+        ok_count   = sum(1 for r in results if r['ok'])
+        fail_count = len(results) - ok_count
+        log.info(f'[apply_dns] Aplicado em {ok_count}/{len(results)} equipamentos '
+                 f'(dns1={dns1} dns2={dns2})')
+        return jsonify_fn({
+            'total':      len(results),
+            'ok':         ok_count,
+            'failed':     fail_count,
+            'dns1':       dns1,
+            'dns2':       dns2,
+            'results':    results,
+        })
 
     @flask_app.route('/api/probe')
     def api_probe():
