@@ -70,9 +70,10 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 BASE_DIR       = Path(__file__).parent
 CSV_PATH       = BASE_DIR / 'Redes Imps CDS' / 'Endereçamento_Atualizado.csv'
-INVENTORY_PATH = BASE_DIR / 'inventory.html'
-CACHE_PATH     = BASE_DIR / 'cache.json'
-TEMPLATE_PATH  = BASE_DIR / 'Templates' / 'inventory_template.html'
+INVENTORY_PATH        = BASE_DIR / 'inventory.html'
+CACHE_PATH            = BASE_DIR / 'cache.json'
+CREDENTIALS_PATH      = BASE_DIR / 'printer_credentials.json'
+TEMPLATE_PATH         = BASE_DIR / 'Templates' / 'inventory_template.html'
 PROBE_PORT     = 5001
 
 SNMP_COMMUNITY  = 'public'
@@ -202,6 +203,8 @@ class PrinterInfo:
     gateway:      Optional[str] = None
     ip_mode:      Optional[str] = None   # 'DHCP' | 'Manual' | 'AutoIP'
     dns_apply_status: Optional[str] = None  # resultado da última aplicação de DNS
+    auth_ok:          Optional[bool] = None  # True se login HTTP na interface web funcionou
+    auth_user:        Optional[str]  = None  # usuário que autenticou na interface web
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -417,18 +420,73 @@ def _http_get_page(ip: str, path: str, use_https: bool = False,
 # ---------------------------------------------------------------------------
 
 def get_network_config(ip: str, manufacturer: str) -> dict:
-    """Coleta hostname, DNS1, DNS2, gateway e modo IP do equipamento.
-
-    HP   → HP JetDirect SNMP MIB (OIDs 1.3.6.1.4.1.11.2.4.3.5.*)
-         fallback → EWS /DevMgmt/NetworkConfigDyn.json
-    Samsung → SyncThru /sws/app/information/network/networkSetting.json
-    """
-    import re
+    # Coleta hostname, DNS1, DNS2, gateway e modo IP do equipamento.
+    # HP      -> SNMP JetDirect MIB  -> EWS JSON  -> SyncThru (/sws/)
+    # Samsung -> SyncThru (/sws/)
+    # Zebra   -> SNMP ZebraNet MIB + HTTP /server/NWSET.htm
+    #
+    # auth_ok/auth_user registram se login HTTP foi bem-sucedido.
+    # None  = nao tentou HTTP auth / SNMP suficiente
+    # False = tentou, falhou em todas as credenciais
+    # True  = autenticou via HTTP com sucesso
+    import re, json as _json
     result = {'hostname': None, 'dns1': None, 'dns2': None,
-              'gateway': None, 'ip_mode': None}
+              'gateway': None, 'ip_mode': None,
+              'auth_ok': None, 'auth_user': None}
+
+    # Credenciais salvas manualmente para este IP tem prioridade
+    _saved = load_printer_credentials().get(ip, {})
+    _sv_u  = _saved.get('user', '')
+    _sv_p  = _saved.get('password', '')
+
+    def _sws_parse(flat):
+        # Extrai campos DNS/gateway/hostname/modo de JSON serializado.
+        dns1_m = re.search(r'(?:primaryDns|dns1|preferredDns)["\s]+([\.\d]{7,15})', flat, re.I)
+        dns2_m = re.search(r'(?:secondaryDns|dns2|alternateDns)["\s]+([\.\d]{7,15})', flat, re.I)
+        gw_m   = re.search(r'(?:gateway|defaultGateway)["\s]+([\.\d]{7,15})', flat, re.I)
+        hn_m   = re.search(r'(?:hostName|hostname)["\s:]+"([^"]{2,80})"', flat, re.I)
+        dhcp_m = re.search(r'(?:dhcp|ipMode|ipMethod)["\s:]+"?([\w]+)"?', flat, re.I)
+        if not dns1_m:
+            return False
+        result['dns1']     = dns1_m.group(1)
+        result['dns2']     = dns2_m.group(1) if dns2_m else None
+        result['gateway']  = gw_m.group(1)   if gw_m   else result.get('gateway')
+        result['hostname'] = hn_m.group(1)   if hn_m   else result.get('hostname')
+        if dhcp_m:
+            v = dhcp_m.group(1).upper()
+            result['ip_mode'] = 'DHCP' if 'DHCP' in v or v == 'TRUE' else 'Manual'
+        return True
+
+    def _try_sws(sws_users, sws_pwds):
+        # Tenta configuracao de rede via SyncThru. Retorna True se achou DNS.
+        _tried_auth = False
+        for sws_path in ('/sws/app/information/network/networkSetting.json',
+                         '/sws/swsapi/swsconfig?subtype=networkSetting'):
+            body = _http_get_page(ip, sws_path)
+            if not body:
+                _tried_auth = True
+                for u in sws_users:
+                    for pw in sws_pwds:
+                        body = _http_get_authenticated(ip, sws_path, u, pw)
+                        if body:
+                            result['auth_ok']   = True
+                            result['auth_user'] = u
+                            break
+                    if body:
+                        break
+            if not body:
+                continue
+            try:
+                if _sws_parse(_json.dumps(_json.loads(body))):
+                    return True
+            except Exception:
+                pass
+        if _tried_auth and result.get('auth_ok') is None:
+            result['auth_ok'] = False
+        return False
 
     if manufacturer == 'HP':
-        # --- SNMP JetDirect (mais confiável) ---
+        # --- SNMP JetDirect (mais confiavel) ---
         hn  = _snmp_get(ip, OID_HP_HOSTNAME) or _snmp_get(ip, OID_STD_HOSTNAME)
         d1  = _snmp_get(ip, OID_HP_DNS_PRIMARY)
         d2  = _snmp_get(ip, OID_HP_DNS_SECONDARY)
@@ -436,112 +494,63 @@ def get_network_config(ip: str, manufacturer: str) -> dict:
         raw_mode = _snmp_get(ip, OID_HP_IP_CONFIG)
         mode_map = {'1': 'BOOTP', '2': 'DHCP', '3': 'Manual', '4': 'AutoIP'}
         if raw_mode and raw_mode.isdigit():
-            ip_mode = mode_map.get(raw_mode, f'Código {raw_mode}')
+            ip_mode = mode_map.get(raw_mode, f'Codigo {raw_mode}')
         else:
             ip_mode = raw_mode
+        result.update({'hostname': hn, 'dns1': d1 or None,
+                       'dns2': d2 or None, 'gateway': gw, 'ip_mode': ip_mode})
 
-        result = {'hostname': hn, 'dns1': d1 or None, 'dns2': d2 or None,
-                  'gateway': gw, 'ip_mode': ip_mode}
-
-        # --- Fallback HTTP EWS JSON (impressoras modernas sem JetDirect MIB) ---
-        if not d1:
+        # --- Fallback EWS JSON (HP tradicionais) ---
+        if not result['dns1']:
+            _ews_tried = False
             for use_https in (True, False):
                 body = _http_get_page(ip, '/DevMgmt/NetworkConfigDyn.json',
                                       use_https=use_https)
                 if not body:
+                    _ews_tried = True
+                    _ews_users = ([_sv_u] if _sv_u else []) + HP_EWS_USERS
+                    _ews_pwds  = ([_sv_p] if _sv_p else []) + HP_EWS_PASSWORDS
+                    for u in _ews_users:
+                        for pw in _ews_pwds:
+                            body = _http_get_authenticated(
+                                ip, '/DevMgmt/NetworkConfigDyn.json', u, pw, use_https)
+                            if body:
+                                result['auth_ok']   = True
+                                result['auth_user'] = u
+                                break
+                        if body:
+                            break
+                if not body:
                     continue
                 try:
-                    import json as _json
                     data = _json.loads(body)
                     def _deep(d, *keys):
                         for k in keys:
-                            if isinstance(d, dict):
-                                d = d.get(k)
-                            else:
-                                return None
+                            d = d.get(k) if isinstance(d, dict) else None
                         return d
-                    dns_cfg = _deep(data, 'NetworkConfigDyn', 'IPConfiguration',
-                                    'DNS')
+                    dns_cfg = _deep(data, 'NetworkConfigDyn', 'IPConfiguration', 'DNS')
                     if dns_cfg:
-                        result['dns1']    = dns_cfg.get('PreferredServer') or result['dns1']
-                        result['dns2']    = dns_cfg.get('AlternateServer')  or result['dns2']
+                        result['dns1'] = dns_cfg.get('PreferredServer') or result['dns1']
+                        result['dns2'] = dns_cfg.get('AlternateServer')  or result['dns2']
                     gw_cfg = _deep(data, 'NetworkConfigDyn', 'IPConfiguration', 'DefaultGateway')
                     if gw_cfg:
                         result['gateway'] = gw_cfg or result['gateway']
-                    break
                 except Exception:
                     pass
+                break
+            if _ews_tried and result.get('auth_ok') is None:
+                result['auth_ok'] = False
+
+        # --- Fallback SyncThru (HP Laser 408 e similares) ---
+        if not result['dns1']:
+            _hp_sws_users = ([_sv_u] if _sv_u else []) + HP_EWS_USERS
+            _hp_sws_pwds  = ([_sv_p] if _sv_p else []) + HP_EWS_PASSWORDS
+            _try_sws(_hp_sws_users, _hp_sws_pwds)
 
     elif manufacturer == 'Samsung':
-        # --- SyncThru JSON (tenta sem auth e depois com auth) ---
-        for sws_path in (
-            '/sws/app/information/network/networkSetting.json',
-            '/sws/swsapi/swsconfig?subtype=networkSetting',
-        ):
-            body = _http_get_page(ip, sws_path)
-            if not body:
-                for pw in SAMSUNG_PASSWORDS:
-                    body = _http_get_authenticated(ip, sws_path, SAMSUNG_USER, pw)
-                    if body:
-                        break
-            if not body:
-                continue
-            try:
-                import json as _json
-                flat = _json.dumps(_json.loads(body))
-                dns1_m = re.search(r'(?:primaryDns|dns1|preferredDns)["\s:]+([\d.]{7,15})', flat, re.I)
-                dns2_m = re.search(r'(?:secondaryDns|dns2|alternateDns)["\s:]+([\d.]{7,15})', flat, re.I)
-                gw_m   = re.search(r'(?:gateway|defaultGateway)["\s:]+([\d.]{7,15})', flat, re.I)
-                hn_m   = re.search(r'(?:hostName|hostname)["\s:]+"([^"]{2,80})"', flat, re.I)
-                dhcp_m = re.search(r'(?:dhcp|ipMode|ipMethod)["\s:]+"?([\w]+)"?', flat, re.I)
-                if dns1_m:
-                    result['dns1']     = dns1_m.group(1)
-                    result['dns2']     = dns2_m.group(1) if dns2_m else None
-                    result['gateway']  = gw_m.group(1)   if gw_m   else None
-                    result['hostname'] = hn_m.group(1)   if hn_m   else None
-                    if dhcp_m:
-                        v = dhcp_m.group(1).upper()
-                        result['ip_mode'] = 'DHCP' if 'DHCP' in v or v == 'TRUE' else 'Manual'
-                    break
-            except Exception:
-                pass
-
-    # HP Laser 408 e modelos similares usam SyncThru (/sws/) em vez de EWS JetDirect
-    if manufacturer == 'HP' and not result.get('dns1'):
-        for sws_path in (
-            '/sws/app/information/network/networkSetting.json',
-            '/sws/swsapi/swsconfig?subtype=networkSetting',
-        ):
-            body = _http_get_page(ip, sws_path)
-            if not body:
-                for u in HP_EWS_USERS:
-                    for pw in HP_EWS_PASSWORDS:
-                        body = _http_get_authenticated(ip, sws_path, u, pw)
-                        if body:
-                            break
-                    if body:
-                        break
-            if not body:
-                continue
-            try:
-                import json as _json
-                flat = _json.dumps(_json.loads(body))
-                dns1_m = re.search(r'(?:primaryDns|dns1|preferredDns)["\s:]+([\d.]{7,15})', flat, re.I)
-                dns2_m = re.search(r'(?:secondaryDns|dns2|alternateDns)["\s:]+([\d.]{7,15})', flat, re.I)
-                gw_m   = re.search(r'(?:gateway|defaultGateway)["\s:]+([\d.]{7,15})', flat, re.I)
-                hn_m   = re.search(r'(?:hostName|hostname)["\s:]+"([^"]{2,80})"', flat, re.I)
-                dhcp_m = re.search(r'(?:dhcp|ipMode|ipMethod)["\s:]+"?([\w]+)"?', flat, re.I)
-                if dns1_m:
-                    result['dns1']     = dns1_m.group(1)
-                    result['dns2']     = dns2_m.group(1) if dns2_m else None
-                    result['gateway']  = gw_m.group(1)   if gw_m   else result.get('gateway')
-                    result['hostname'] = hn_m.group(1)   if hn_m   else result.get('hostname')
-                    if dhcp_m:
-                        v = dhcp_m.group(1).upper()
-                        result['ip_mode'] = 'DHCP' if 'DHCP' in v or v == 'TRUE' else 'Manual'
-                    break
-            except Exception:
-                pass
+        _sam_users = [_sv_u] if _sv_u else [SAMSUNG_USER]
+        _sam_pwds  = ([_sv_p] if _sv_p else []) + SAMSUNG_PASSWORDS
+        _try_sws(_sam_users, _sam_pwds)
 
     elif manufacturer == 'Zebra':
         # Hostname via SNMP sysName
@@ -551,25 +560,33 @@ def get_network_config(ip: str, manufacturer: str) -> dict:
         if gw_snmp and gw_snmp not in ('0.0.0.0', '0', ''):
             result['gateway'] = gw_snmp
         # DNS via HTTP scraping do ZebraNet web (/server/NWSET.htm)
+        _z_user = _sv_u or ZEBRA_USER
+        _z_pwds = ([_sv_p] if _sv_p else []) + ZEBRA_PASSWORDS
+        _z_tried = False
         for use_https in (False, True):
             body = _http_get_page(ip, '/server/NWSET.htm', use_https=use_https)
             if not body:
-                for pw in ZEBRA_PASSWORDS:
+                _z_tried = True
+                for pw in _z_pwds:
                     body = _http_get_authenticated(ip, '/server/NWSET.htm',
-                                                   ZEBRA_USER, pw, use_https=use_https)
+                                                   _z_user, pw, use_https=use_https)
                     if body:
+                        result['auth_ok']   = True
+                        result['auth_user'] = _z_user
                         break
             if body:
-                d1 = re.search(r'name=["\']?(?:dns1|DNS1|primarydns)["\']?[^>]*?value=["\']([.\d]{7,15})["\']', body, re.I)
-                d2 = re.search(r'name=["\']?(?:dns2|DNS2|secondarydns)["\']?[^>]*?value=["\']([.\d]{7,15})["\']', body, re.I)
-                gw = re.search(r'name=["\']?(?:gw|gateway|defaultgateway)["\']?[^>]*?value=["\']([.\d]{7,15})["\']', body, re.I)
+                d1 = re.search(r"name=[\"']?(?:dns1|DNS1|primarydns)[\"']?[^>]*?value=[\"']([.\d]{7,15})[\"']", body, re.I)
+                d2 = re.search(r"name=[\"']?(?:dns2|DNS2|secondarydns)[\"']?[^>]*?value=[\"']([.\d]{7,15})[\"']", body, re.I)
+                gw = re.search(r"name=[\"']?(?:gw|gateway|defaultgateway)[\"']?[^>]*?value=[\"']([.\d]{7,15})[\"']", body, re.I)
                 if not d1:
-                    d1 = re.search(r'(?i)dns.{0,20}?value=["\']([.\d]{7,15})["\']', body)
+                    d1 = re.search(r"(?i)dns.{0,20}?value=[\"']([.\d]{7,15})[\"']", body)
                 if d1:
                     result['dns1'] = d1.group(1)
                     if d2: result['dns2']    = d2.group(1)
                     if gw: result['gateway'] = gw.group(1) or result.get('gateway')
                     break
+        if _z_tried and result.get('auth_ok') is None:
+            result['auth_ok'] = False
         dhcp_oid = _snmp_get(ip, '1.3.6.1.4.1.10642.1.2.3.4.0')
         if dhcp_oid:
             result['ip_mode'] = 'DHCP' if dhcp_oid in ('1', 'true', 'dhcp') else 'Manual'
@@ -580,9 +597,8 @@ def get_network_config(ip: str, manufacturer: str) -> dict:
         if v in (None, '', '0.0.0.0', '0'):
             result[k] = None
 
-    log.debug(f'[netcfg] {ip} → {result}')
+    log.debug(f'[netcfg] {ip} -> {result}')
     return result
-
 
 def _http_get_authenticated(ip: str, path: str, user: str, password: str,
                             use_https: bool = False) -> Optional[str]:
@@ -1135,6 +1151,25 @@ def save_cache(printers: list[dict]) -> None:
         log.error(f'Erro ao salvar cache: {exc}')
 
 
+def load_printer_credentials() -> dict:
+    """Carrega credenciais por IP de printer_credentials.json."""
+    try:
+        return json.loads(CREDENTIALS_PATH.read_text(encoding='utf-8'))
+    except Exception:
+        return {}
+
+
+def save_printer_credentials(creds: dict) -> None:
+    """Persiste credenciais por IP em printer_credentials.json."""
+    try:
+        CREDENTIALS_PATH.write_text(
+            json.dumps(creds, ensure_ascii=False, indent=2),
+            encoding='utf-8',
+        )
+    except Exception as exc:
+        log.error(f'Erro ao salvar credenciais: {exc}')
+
+
 def update_metrics_from_cache(cached: dict) -> dict:
     """Atualiza campos dinâmicos; re-detecta modelo/fabricante se inválidos."""
     ip     = cached['ip']
@@ -1175,15 +1210,18 @@ def update_metrics_from_cache(cached: dict) -> dict:
     else:
         updated['metrica'] = get_page_count(ip)
 
-    # Configuração de rede: só coleta se ainda não foi coletada antes.
-    # Evita overhead no ciclo de update (SNMP+HTTP extra por host).
-    if mfr in ('HP', 'Samsung', 'Zebra') and not updated.get('dns1') and not updated.get('hostname'):
+    # Configuração de rede: coleta se dns1 ainda não foi obtido.
+    # Corrigido: checa apenas dns1 (hostname pode existir sem dns via SNMP).
+    if mfr in ('HP', 'Samsung', 'Zebra') and not updated.get('dns1'):
         netcfg = get_network_config(ip, mfr)
         updated['hostname'] = netcfg.get('hostname') or updated.get('hostname')
         updated['dns1']     = netcfg.get('dns1')     or updated.get('dns1')
         updated['dns2']     = netcfg.get('dns2')     or updated.get('dns2')
         updated['gateway']  = netcfg.get('gateway')  or updated.get('gateway')
         updated['ip_mode']  = netcfg.get('ip_mode')  or updated.get('ip_mode')
+        if netcfg.get('auth_ok') is not None:
+            updated['auth_ok']   = netcfg['auth_ok']
+            updated['auth_user'] = netcfg.get('auth_user')
 
     updated['last_updated'] = now
     return updated
@@ -1532,6 +1570,8 @@ def scan_network(entry: dict, known_ips: set[str]) -> list[dict]:
             dns2=netcfg.get('dns2'),
             gateway=netcfg.get('gateway'),
             ip_mode=netcfg.get('ip_mode'),
+            auth_ok=netcfg.get('auth_ok'),
+            auth_user=netcfg.get('auth_user'),
         ).to_dict()
 
         log.info(
@@ -1810,7 +1850,8 @@ def _register_routes(flask_app, req, jsonify_fn, render_tmpl):
         fields = ['ip', 'filial', 'fabricante', 'modelo', 'serial', 'tipo',
                   'metrica', 'toner', 'consumivel2',
                   'hostname', 'dns1', 'dns2', 'gateway', 'ip_mode',
-                  'status', 'first_seen', 'last_updated', 'dns_apply_status']
+                  'status', 'first_seen', 'last_updated', 'dns_apply_status',
+                  'auth_ok', 'auth_user']
 
         buf = io.StringIO()
         writer = csv.DictWriter(buf, fieldnames=fields, extrasaction='ignore',
@@ -1831,6 +1872,59 @@ def _register_routes(flask_app, req, jsonify_fn, render_tmpl):
                 'Content-Type': 'text/csv; charset=utf-8',
             }
         )
+
+    @flask_app.route('/api/set-credentials', methods=['POST'])
+    def api_set_credentials():
+        """Salva credenciais por IP e recoleta configuracao de rede.
+
+        Body JSON: { "ip": "x.x.x.x", "user": "admin", "password": "senha" }
+        Para remover credencial: omite ou deixa vazio o campo 'user'.
+        Retorna: { "ok": true, "auth_ok": bool|null, "auth_user": str, "netcfg": {...} }
+        """
+        import json as _json
+        try:
+            body = _json.loads(req.get_data(as_text=True) or '{}')
+        except Exception:
+            return jsonify_fn({'error': 'JSON invalido'}), 400
+
+        ip       = (body.get('ip') or '').strip()
+        user     = (body.get('user') or '').strip()
+        password = body.get('password', '')
+
+        if not ip:
+            return jsonify_fn({'ok': False, 'error': 'ip obrigatorio'}), 400
+
+        creds = load_printer_credentials()
+        if user:
+            creds[ip] = {'user': user, 'password': password}
+        elif ip in creds:
+            del creds[ip]
+        save_printer_credentials(creds)
+
+        # Recoleta configuracao de rede usando as novas credenciais
+        cache = load_cache()
+        p = cache.get(ip, {})
+        mfr = p.get('fabricante', '')
+        netcfg = {}
+        if mfr in ('HP', 'Samsung', 'Zebra'):
+            netcfg = get_network_config(ip, mfr)
+            for k in ('hostname', 'dns1', 'dns2', 'gateway', 'ip_mode', 'auth_ok', 'auth_user'):
+                if netcfg.get(k) is not None:
+                    p[k] = netcfg[k]
+            if p:
+                cache[ip] = p
+                # save_cache espera lista
+                save_cache(list(cache.values()))
+
+        log.info(f'[set-cred] {ip} user={user!r} auth_ok={p.get("auth_ok")}')
+        return jsonify_fn({
+            'ok':        True,
+            'auth_ok':   p.get('auth_ok'),
+            'auth_user': p.get('auth_user'),
+            'dns1':      p.get('dns1'),
+            'dns2':      p.get('dns2'),
+            'netcfg':    {k: v for k, v in netcfg.items() if k not in ('auth_ok', 'auth_user')},
+        })
 
     @flask_app.route('/api/apply-dns', methods=['POST'])
     def api_apply_dns():

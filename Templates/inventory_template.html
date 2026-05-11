@@ -157,6 +157,38 @@ td.td-dns-bad { background: rgba(239,68,68,.1); }
   font-family: "Cascadia Code", Consolas, monospace; font-size: .72rem;
   color: #94a3b8; white-space: pre-wrap; word-break: break-all;
 }
+/* ---- Auth status icon ---- */
+.auth-icon { cursor:pointer; margin-left:6px; font-size:.78rem; vertical-align:middle; user-select:none; }
+.auth-ok   { color:#4ade80; }
+.auth-fail { color:#f87171; }
+.auth-none { color:#475569; }
+/* ---- Export button ---- */
+.btn-export { background:#0f2a1a; border:1px solid #1a5c30; color:#4ade80; padding:6px 14px;
+  border-radius:7px; font-size:.78rem; font-weight:600; cursor:pointer; white-space:nowrap; }
+.btn-export:hover { opacity:.85; }
+/* ---- Credentials modal ---- */
+.modal-overlay { position:fixed; inset:0; background:rgba(0,0,0,.78); z-index:999;
+  display:flex; align-items:center; justify-content:center; }
+.modal-overlay.hidden { display:none; }
+.modal-box { background:#13161f; border:1px solid #2d3148; border-radius:14px;
+  padding:24px 28px; min-width:340px; max-width:460px; width:90%; }
+.modal-box h3 { font-size:.95rem; font-weight:700; color:#f1f5f9; margin-bottom:16px; }
+.modal-field { display:flex; flex-direction:column; gap:4px; margin-bottom:12px; }
+.modal-field label { font-size:.67rem; color:#64748b; font-weight:700;
+  text-transform:uppercase; letter-spacing:.5px; }
+.modal-field input { background:#1a1d27; border:1px solid #2d3148; border-radius:7px;
+  color:#e2e8f0; padding:8px 10px; font-size:.84rem; outline:none; transition:border-color .15s; }
+.modal-field input:focus { border-color:#3b82f6; }
+.modal-field input[readonly] { color:#64748b; cursor:default; }
+.modal-actions { display:flex; gap:10px; justify-content:flex-end; margin-top:18px; }
+.btn-mc { padding:7px 16px; border-radius:7px; font-size:.82rem; cursor:pointer;
+  border:1px solid; font-weight:600; }
+.btn-mc-cancel  { background:#1a1d27; border-color:#2d3148; color:#64748b; }
+.btn-mc-confirm { background:#1a3060; border-color:#3b82f6; color:#60a5fa; }
+.btn-mc:disabled { opacity:.4; cursor:not-allowed; }
+.modal-status { font-size:.77rem; color:#94a3b8; margin-top:10px; min-height:18px; }
+.modal-status.ok   { color:#4ade80; }
+.modal-status.fail { color:#f87171; }
 </style>
 </head>
 <body>
@@ -181,7 +213,10 @@ td.td-dns-bad { background: rgba(239,68,68,.1); }
 <main class="main">
   <div class="topbar">
     <h1 id="main-title">&#128424; Selecione um CD</h1>
-    <span class="ts-badge">Invent&aacute;rio: $TIMESTAMP</span>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <button class="btn-export" onclick="exportCSV()" title="Exportar dados vis&iacute;veis como CSV">&#8659; Exportar CSV</button>
+      <span class="ts-badge">Invent&aacute;rio: $TIMESTAMP</span>
+    </div>
   </div>
 
   <div id="scan-banner" class="scan-banner running" style="display:none">
@@ -413,6 +448,16 @@ function makeRow(p) {
   var gwHtml   = gwv   ? '<span class="dns-cell">' + esc(gwv)   + '</span>' : '<span class="dns-cell na">\u2014</span>';
   var modeHtml = modev ? '<span class="dns-cell">' + esc(modev) + '</span>' : '<span class="dns-cell na">\u2014</span>';
 
+  // Auth status icon
+  var authOkNum = p.auth_ok === true ? 1 : (p.auth_ok === false ? 0 : -1);
+  var authCls   = p.auth_ok === true ? 'auth-ok' : (p.auth_ok === false ? 'auth-fail' : 'auth-none');
+  var authTip   = p.auth_ok === true
+    ? '\u2713 Web auth OK: ' + esc(p.auth_user || '') + ' \u2014 clique para reconfigurar'
+    : (p.auth_ok === false ? '\u2717 Falha no login web \u2014 clique para configurar credenciais' : 'Login web n\u00e3o tentado \u2014 clique para configurar');
+  var authIcon = '<span class="auth-icon ' + authCls + '" '
+    + 'onclick="openAuthModal(\'' + esc(p.ip) + '\',\'' + esc(p.fabricante||'') + '\',' + authOkNum + ',\'' + esc(p.auth_user||'') + '\')" '
+    + 'title="' + authTip + '">&#128273;</span>';
+
   return '<tr data-ip="' + esc(p.ip) + '" data-fab="' + esc(p.fabricante||'') + '" ' +
          'data-tipo="' + esc(p.tipo||'') + '" ' +
          'data-serial="' + esc((p.serial||'').toLowerCase()) + '" ' +
@@ -421,6 +466,7 @@ function makeRow(p) {
     '<td>' +
       '<a href="http://' + esc(p.ip) + '/" target="_blank" class="cell-ip" title="Abrir interface web">' + esc(p.ip) + '</a>' +
       '<a href="' + esc(PROBE_BASE) + '/probe?ip=' + esc(p.ip) + '" target="_blank" class="probe-lnk" title="Probe">&#128269;</a>' +
+      authIcon +
     '</td>' +
     '<td><span class="badge-mfr ' + mfrCls + '">' + esc(p.fabricante||'') + '</span></td>' +
     '<td>' + modelHtml + '</td>' +
@@ -641,8 +687,118 @@ function _pollStatus() {
     .catch(function() { /* servidor pode não ter /api/status */ });
 }
 
+// ---- CSV Export ---------------------------------------------------------
+function exportCSV() {
+  var activeItem = document.querySelector('.cd-item.active');
+  var cd = activeItem ? (activeItem.dataset.cd || '') : '';
+  var url = PROBE_BASE + '/api/export-csv' + (cd ? '?cd=' + encodeURIComponent(cd) : '');
+  var a = document.createElement('a');
+  a.href = url; a.download = ''; a.style.display = 'none';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+}
+
+// ---- Credentials Modal ---------------------------------------------------
+function openAuthModal(ip, fab, authOk, authUser) {
+  document.getElementById('cred-ip').value   = ip;
+  document.getElementById('cred-fab').value  = fab;
+  document.getElementById('cred-user').value = '';
+  document.getElementById('cred-pass').value = '';
+  var s = document.getElementById('cred-status');
+  if (authOk === 1) {
+    s.textContent = '\u2713 Autenticado como: ' + (authUser || 'ok');
+    s.className = 'modal-status ok';
+  } else if (authOk === 0) {
+    s.textContent = '\u2717 Falha no login web \u2014 insira as credenciais corretas abaixo.';
+    s.className = 'modal-status fail';
+  } else {
+    s.textContent = 'Login web n\u00e3o tentado ou SNMP foi suficiente.';
+    s.className = 'modal-status';
+  }
+  document.getElementById('auth-modal').classList.remove('hidden');
+  setTimeout(function() { document.getElementById('cred-user').focus(); }, 50);
+}
+
+function closeAuthModal() {
+  document.getElementById('auth-modal').classList.add('hidden');
+}
+
+function submitCredentials() {
+  var ip   = document.getElementById('cred-ip').value;
+  var user = document.getElementById('cred-user').value.trim();
+  var pass = document.getElementById('cred-pass').value;
+  if (!user) { alert('Informe o usu\u00e1rio.'); return; }
+  var btn = document.getElementById('btn-cred-save');
+  var s   = document.getElementById('cred-status');
+  btn.disabled = true; btn.textContent = 'Testando...';
+  s.textContent = 'Salvando e testando conex\u00e3o...'; s.className = 'modal-status';
+  fetch(PROBE_BASE + '/api/set-credentials', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ip: ip, user: user, password: pass})
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(data) {
+    if (data.auth_ok === true) {
+      s.textContent = '\u2713 Login OK! DNS e rede atualizados no cache.';
+      s.className = 'modal-status ok';
+      var p = _currentPrinters.find(function(x) { return x.ip === ip; });
+      if (p) {
+        p.auth_ok = true; p.auth_user = data.auth_user;
+        var nc = data.netcfg || {};
+        ['dns1','dns2','gateway','hostname','ip_mode'].forEach(function(k) {
+          if (nc[k]) p[k] = nc[k];
+        });
+        renderTable(_currentPrinters); applyFilters(); updateStats(_currentPrinters);
+      }
+    } else if (data.auth_ok === false) {
+      s.textContent = '\u2717 Credenciais salvas, mas login falhou. Verifique usu\u00e1rio/senha.';
+      s.className = 'modal-status fail';
+    } else {
+      s.textContent = 'Credenciais salvas. Resultado da coleta: ' + JSON.stringify(data.netcfg || {});
+      s.className = 'modal-status';
+    }
+  })
+  .catch(function(e) {
+    s.textContent = 'Erro de rede: ' + String(e);
+    s.className = 'modal-status fail';
+  })
+  .finally(function() { btn.disabled = false; btn.textContent = 'Salvar e Testar'; });
+}
+
 _pollStatus();
 </script>
+
+<!-- ======= CREDENTIALS MODAL ======= -->
+<div id="auth-modal" class="modal-overlay hidden" onclick="if(event.target===this)closeAuthModal()">
+  <div class="modal-box">
+    <h3>&#128273; Credenciais do Equipamento</h3>
+    <div style="display:flex;gap:10px">
+      <div class="modal-field" style="flex:1">
+        <label>IP</label>
+        <input type="text" id="cred-ip" readonly>
+      </div>
+      <div class="modal-field" style="flex:1">
+        <label>Fabricante</label>
+        <input type="text" id="cred-fab" readonly>
+      </div>
+    </div>
+    <div class="modal-field">
+      <label>Usu&aacute;rio</label>
+      <input type="text" id="cred-user" placeholder="admin / administrador" autocomplete="off">
+    </div>
+    <div class="modal-field">
+      <label>Senha</label>
+      <input type="password" id="cred-pass" placeholder="Senha da interface web" autocomplete="new-password"
+             onkeydown="if(event.key==='Enter')submitCredentials()">
+    </div>
+    <div id="cred-status" class="modal-status"></div>
+    <div class="modal-actions">
+      <button class="btn-mc btn-mc-cancel" onclick="closeAuthModal()">Cancelar</button>
+      <button id="btn-cred-save" class="btn-mc btn-mc-confirm" onclick="submitCredentials()">Salvar e Testar</button>
+    </div>
+  </div>
+</div>
+
 </body>
 </html>
 
