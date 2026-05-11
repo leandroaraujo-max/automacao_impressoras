@@ -1053,8 +1053,9 @@ def update_metrics_from_cache(cached: dict) -> dict:
     else:
         updated['metrica'] = get_page_count(ip)
 
-    # Atualiza configuração de rede (sempre que for HP ou Samsung)
-    if mfr in ('HP', 'Samsung'):
+    # Configuração de rede: só coleta se ainda não foi coletada antes.
+    # Evita overhead no ciclo de update (SNMP+HTTP extra por host).
+    if mfr in ('HP', 'Samsung') and not updated.get('dns1') and not updated.get('hostname'):
         netcfg = get_network_config(ip, mfr)
         updated['hostname'] = netcfg.get('hostname') or updated.get('hostname')
         updated['dns1']     = netcfg.get('dns1')     or updated.get('dns1')
@@ -1302,12 +1303,19 @@ def detect_manufacturer(ip: str) -> Optional[str]:
 # Scan por rede
 # ---------------------------------------------------------------------------
 def scan_network(entry: dict, known_ips: set[str]) -> list[dict]:
-    """Escaneia uma rede; ignora IPs já no cache (serão atualizados separadamente)."""
+    """Escaneia uma rede; ignora IPs já no cache (serão atualizados separadamente).
+
+    Fase 1 (dentro do semáforo nmap): nmap descobre hosts com portas abertas.
+    Fase 2 (fora do semáforo, em paralelo): identifica fabricante e coleta dados
+            de cada host candidato simultaneamente — reduz de ~8s/host para ~8s/rede.
+    """
     network = entry['network']
     cd      = entry['cd']
     found: list[dict] = []
     now = datetime.now().isoformat(timespec='seconds')
 
+    # ---- Fase 1: nmap (serializado pelo semáforo) ---------------------------
+    candidates: list[tuple[str, set[int]]] = []
     with _nmap_sem:
         try:
             log.info(f'[CD {cd}] Scan nmap: {network}')
@@ -1326,76 +1334,99 @@ def scan_network(entry: dict, known_ips: set[str]) -> list[dict]:
                     continue
                 if host in known_ips:
                     log.debug(f'[CD {cd}] {host} já no cache — será atualizado')
-                    continue  # host já no cache — será atualizado pelo updater
+                    continue
 
-                # Portas de impressão abertas = quase certamente uma impressora
                 open_ports: set[int] = set()
                 for proto in ('tcp', 'udp'):
                     if proto in nm[host]:
                         for p, info in nm[host][proto].items():
                             if info.get('state') == 'open':
                                 open_ports.add(p)
-                is_printer_port = bool(open_ports & {631, 9100})
 
-                manufacturer = detect_manufacturer(host)
-                if manufacturer not in KNOWN_MANUFACTURERS:
-                    if is_printer_port:
-                        log.info(f'[CD {cd}] {host} — porta 9100/631 aberta, fabricante nao identificado → adicionado como Desconhecido')
-                        manufacturer = 'Desconhecido'
-                    else:
-                        log.info(f'[CD {cd}] {host} — fabricante nao identificado, sem porta de impressao')
-                        continue
-
-                tipo_real = resolve_tipo(manufacturer)
-                serial    = get_serial(host, manufacturer)
-                modelo    = get_model(host, manufacturer)
-                toner     = None
-                consumivel2 = None
-
-                if manufacturer == 'Zebra':
-                    metrica = get_zebra_odometer(host)
-                elif manufacturer == 'HP':
-                    metrica = get_page_count(host)
-                    toner, consumivel2 = get_hp_consumables(host)
-                elif manufacturer == 'Samsung':
-                    metrica = get_page_count(host)
-                    toner, consumivel2 = get_samsung_consumables(host)
-                else:  # Honeywell
-                    metrica = get_page_count(host)
-
-                # Coleta configuração de rede (DNS, Gateway, Hostname)
-                netcfg = {}
-                if manufacturer in ('HP', 'Samsung'):
-                    netcfg = get_network_config(host, manufacturer)
-
-                printer = PrinterInfo(
-                    ip=host,
-                    fabricante=manufacturer,
-                    modelo=modelo,
-                    serial=serial,
-                    metrica=metrica,
-                    toner=toner,
-                    consumivel2=consumivel2,
-                    status='Online',
-                    filial=cd,
-                    tipo=tipo_real,
-                    first_seen=now,
-                    last_updated=now,
-                    hostname=netcfg.get('hostname'),
-                    dns1=netcfg.get('dns1'),
-                    dns2=netcfg.get('dns2'),
-                    gateway=netcfg.get('gateway'),
-                    ip_mode=netcfg.get('ip_mode'),
-                ).to_dict()
-
-                log.info(
-                    f'[CD {cd}] NOVO {host} ({manufacturer}/{tipo_real}) '
-                    f'modelo={modelo} serial={serial} metrica={metrica}'
-                )
-                found.append(printer)
+                if open_ports & {631, 9100, 80, 443}:
+                    candidates.append((host, open_ports))
+                else:
+                    log.debug(f'[CD {cd}] {host} ignorado — portas: {open_ports}')
 
         except Exception as exc:
             log.error(f'Erro ao escanear {network}: {exc}')
+            return found
+
+    if not candidates:
+        return found
+
+    log.info(f'[CD {cd}] {len(candidates)} candidato(s) para identificação paralela em {network}')
+
+    # ---- Fase 2: identificação paralela (fora do semáforo nmap) -------------
+    lock_found = threading.Lock()
+
+    def _identify_host(host: str, open_ports: set[int]) -> None:
+        is_printer_port = bool(open_ports & {631, 9100})
+        manufacturer = detect_manufacturer(host)
+        if manufacturer not in KNOWN_MANUFACTURERS:
+            if is_printer_port:
+                log.info(f'[CD {cd}] {host} — porta 9100/631 aberta, fabricante nao identificado → adicionado como Desconhecido')
+                manufacturer = 'Desconhecido'
+            else:
+                log.info(f'[CD {cd}] {host} — fabricante nao identificado, sem porta de impressao')
+                return
+
+        tipo_real   = resolve_tipo(manufacturer)
+        serial      = get_serial(host, manufacturer)
+        modelo      = get_model(host, manufacturer)
+        toner       = None
+        consumivel2 = None
+
+        if manufacturer == 'Zebra':
+            metrica = get_zebra_odometer(host)
+        elif manufacturer == 'HP':
+            metrica = get_page_count(host)
+            toner, consumivel2 = get_hp_consumables(host)
+        elif manufacturer == 'Samsung':
+            metrica = get_page_count(host)
+            toner, consumivel2 = get_samsung_consumables(host)
+        else:
+            metrica = get_page_count(host)
+
+        netcfg = {}
+        if manufacturer in ('HP', 'Samsung'):
+            netcfg = get_network_config(host, manufacturer)
+
+        printer = PrinterInfo(
+            ip=host,
+            fabricante=manufacturer,
+            modelo=modelo,
+            serial=serial,
+            metrica=metrica,
+            toner=toner,
+            consumivel2=consumivel2,
+            status='Online',
+            filial=cd,
+            tipo=tipo_real,
+            first_seen=now,
+            last_updated=now,
+            hostname=netcfg.get('hostname'),
+            dns1=netcfg.get('dns1'),
+            dns2=netcfg.get('dns2'),
+            gateway=netcfg.get('gateway'),
+            ip_mode=netcfg.get('ip_mode'),
+        ).to_dict()
+
+        log.info(
+            f'[CD {cd}] NOVO {host} ({manufacturer}/{tipo_real}) '
+            f'modelo={modelo} serial={serial} metrica={metrica}'
+        )
+        with lock_found:
+            found.append(printer)
+
+    host_threads = [
+        threading.Thread(target=_identify_host, args=(h, op), daemon=True)
+        for h, op in candidates
+    ]
+    for t in host_threads:
+        t.start()
+    for t in host_threads:
+        t.join()
 
     return found
 
@@ -1428,11 +1459,15 @@ def run_full_scan(update_only: bool = False) -> list[dict]:
     _scan_status['total'] = len(all_printers)
 
     # ---- Passo 1: atualiza métricas dos hosts já conhecidos -----------------
+    # Semáforo para limitar conexões simultâneas no update (evita saturar a rede)
+    _update_sem = threading.Semaphore(20)
+
     if known_ips:
         log.info(f'Atualizando métricas de {len(known_ips)} hosts em cache...')
 
         def _update_worker(cached: dict) -> None:
-            updated = update_metrics_from_cache(cached)
+            with _update_sem:
+                updated = update_metrics_from_cache(cached)
             with lock:
                 all_printers[updated['ip']] = updated
                 _scan_status['total'] = len(all_printers)
