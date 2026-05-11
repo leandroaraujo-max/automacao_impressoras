@@ -93,10 +93,25 @@ body { font-family: "Segoe UI", system-ui, sans-serif; background: #0f1117; colo
 .state-msg strong { display: block; font-size: 1.5rem; margin-bottom: 10px; color: #64748b; }
 
 /* ---- Table ---- */
-.table-wrap { overflow-x: auto; border-radius: 12px; border: 1px solid #2d3148; background: #1a1d27; }
+/* overflow:auto + max-height: scrollbar horizontal aparece no meio da pagina,
+   e o header fica fixo durante a rolagem vertical */
+.table-wrap { overflow: auto; max-height: calc(100vh - 310px); min-height: 280px; border-radius: 12px; border: 1px solid #2d3148; background: #1a1d27; }
 table { width: 100%; border-collapse: collapse; }
 thead tr { background: #141720; }
-th { padding: 10px 14px; text-align: left; font-size: .65rem; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: .6px; border-bottom: 1px solid #2d3148; white-space: nowrap; }
+th {
+  padding: 10px 14px; text-align: left; font-size: .65rem; font-weight: 700; color: #64748b;
+  text-transform: uppercase; letter-spacing: .6px; border-bottom: 2px solid #2d3148; white-space: nowrap;
+  /* sticky header */
+  position: sticky; top: 0; z-index: 10; background: #141720;
+  /* sortable columns */
+  cursor: pointer; user-select: none; transition: color .12s, background .12s;
+}
+th:hover { color: #94a3b8; background: #191d2b; }
+th.sortable::after  { content: ' \2B0D'; opacity: 0.25; font-size: .65rem; }
+th.sort-asc::after  { content: ' \2191'; color: #60a5fa; font-size: .7rem; opacity: 1; }
+th.sort-desc::after { content: ' \2193'; color: #60a5fa; font-size: .7rem; opacity: 1; }
+th.no-sort { cursor: default; }
+th.no-sort::after { content: none; }
 td { padding: 9px 14px; font-size: .82rem; color: #cbd5e1; border-bottom: 1px solid #1e2233; vertical-align: middle; }
 tbody tr:last-child td { border-bottom: none; }
 tbody tr:hover { background: #1f2235; }
@@ -135,6 +150,15 @@ tbody tr:hover { background: #1f2235; }
 .dns-cell.na { color: #374151; font-style: italic; }
 .dns-bad { color: #f87171 !important; font-weight: 700; }
 td.td-dns-bad { background: rgba(239,68,68,.1); }
+.dns-badge-set    { display:inline-block; background:#0d2218; border:1px solid #166534; color:#4ade80;
+  border-radius:5px; padding:1px 8px; font-size:.7rem; font-weight:700;
+  font-family:"Cascadia Code",Consolas,monospace; }
+.dns-badge-notset { display:inline-block; background:#2a1a00; border:1px solid #7c5a0a; color:#fbbf24;
+  border-radius:5px; padding:1px 8px; font-size:.7rem; font-weight:700;
+  font-family:"Cascadia Code",Consolas,monospace; }
+.dns-badge-none   { display:inline-block; background:#1a1d27; border:1px solid #2d3148; color:#475569;
+  border-radius:5px; padding:1px 8px; font-size:.7rem;
+  font-family:"Cascadia Code",Consolas,monospace; font-style:italic; }
 
 /* ---- DNS panel ---- */
 .dns-panel { background: #13161f; border: 1px solid #2d3148; border-radius: 12px; margin-bottom: 16px; overflow: hidden; }
@@ -259,6 +283,15 @@ td.td-dns-bad { background: rgba(239,68,68,.1); }
       <label>Serial / Modelo</label>
       <input type="text" id="f-serial" class="filter-input" placeholder="Buscar..." oninput="applyFilters()">
     </div>
+    <div class="filter-group">
+      <label>DNS Status</label>
+      <select id="f-dns" class="filter-select" onchange="applyFilters()">
+        <option value="">Todos</option>
+        <option value="set">Com IP configurado</option>
+        <option value="notset">NOT SET</option>
+        <option value="none">N&atilde;o coletado</option>
+      </select>
+    </div>
     <button class="btn-clear" onclick="clearFilters()">&#10005; Limpar</button>
     <div class="filter-group" style="flex-direction:row;align-items:center;gap:6px;">
       <input type="checkbox" id="f-dns-only" onchange="applyFilters()" style="accent-color:#3b82f6;cursor:pointer">
@@ -335,6 +368,55 @@ function tonerClass(val) {
   return 'v-toner ' + (p >= 30 ? 'v-ok' : p >= 15 ? 'v-warn' : 'v-crit');
 }
 
+// Renderiza célula DNS: IP real, badge NOT SET, ou travessão
+function dnsHtml(val, isBad) {
+  if (!val) return '<span class="dns-cell na">\u2014</span>';
+  var u = val.toUpperCase();
+  if (u === 'NOT_SET' || u === 'NOTSET' || u === 'NOT SET')
+    return '<span class="dns-badge-notset" title="DNS n\u00e3o configurado manualmente (DHCP ou vazio)">NOT SET</span>';
+  return '<span class="dns-cell' + (isBad ? ' dns-bad' : '') + '">' + esc(val) + '</span>';
+}
+
+// ---- Sort ----------------------------------------------------------
+var _sortCol = null;
+var _sortDir = 1; // 1 = asc, -1 = desc
+
+function _getSortVal(p, col) {
+  var v = p[col];
+  if (col === 'ip') {
+    var pts = String(v||'').split('.').map(function(x){return parseInt(x,10)||0;});
+    return ((pts[0]||0)*16777216)+((pts[1]||0)*65536)+((pts[2]||0)*256)+(pts[3]||0);
+  }
+  if (col === 'metrica') {
+    var mm = String(v||'').match(/[\d,]+/);
+    return mm ? parseFloat(mm[0].replace(/,/g,'')) : -1;
+  }
+  if (col === 'toner' || col === 'consumivel2') {
+    var mm2 = String(v||'').match(/(\d+)/);
+    return mm2 ? parseInt(mm2[1],10) : -1;
+  }
+  if (col === 'last_updated' || col === 'first_seen') { return v ? new Date(v).getTime() : 0; }
+  return String(v||'').toLowerCase();
+}
+
+function sortBy(col) {
+  if (_sortCol === col) { _sortDir = -_sortDir; }
+  else { _sortCol = col; _sortDir = 1; }
+  _currentPrinters.sort(function(a, b) {
+    var va = _getSortVal(a, col), vb = _getSortVal(b, col);
+    return (va < vb ? -1 : va > vb ? 1 : 0) * _sortDir;
+  });
+  renderTable(_currentPrinters);
+  updateStats(_currentPrinters);
+  applyFilters();
+}
+
+function _thSort(col, label) {
+  var cls = 'sortable';
+  if (_sortCol === col) cls = _sortDir === 1 ? 'sort-asc' : 'sort-desc';
+  return '<th class="' + cls + '" onclick="sortBy(\'' + col + '\')" title="Ordenar por ' + label + '">' + label + '</th>';
+}
+
 // ---- Sidebar -------------------------------------------------------
 function buildCdList() {
   var list = document.getElementById('cd-list');
@@ -393,13 +475,23 @@ function renderTable(printers) {
   }
   var rows = printers.map(makeRow).join('');
   document.getElementById('content').innerHTML =
-    '<div class="table-wrap"><table>' +
+    '<div class="table-wrap" id="tbl-wrap"><table>' +
     '<thead><tr>' +
-      '<th>IP</th><th>Fabricante</th><th>Modelo</th><th>N.\u00ba S\u00e9rie</th>' +
-      '<th>Contador / Od\u00f4m.</th><th>Toner</th><th>Kit / Drum</th>' +
-      '<th>Tipo</th><th>Status</th>' +
-      '<th>Hostname</th><th>DNS 1</th><th>DNS 2</th><th>Gateway</th><th>Modo IP</th>' +
-      '<th>Atualizado</th>' +
+      _thSort('ip',          'IP') +
+      _thSort('fabricante',  'Fabricante') +
+      _thSort('modelo',      'Modelo') +
+      _thSort('serial',      'N.\u00ba S\u00e9rie') +
+      _thSort('metrica',     'Contador / Od\u00f4m.') +
+      _thSort('toner',       'Toner') +
+      _thSort('consumivel2', 'Kit / Drum') +
+      _thSort('tipo',        'Tipo') +
+      '<th class="no-sort">Status</th>' +
+      _thSort('hostname',    'Hostname') +
+      _thSort('dns1',        'DNS 1') +
+      _thSort('dns2',        'DNS 2') +
+      _thSort('gateway',     'Gateway') +
+      _thSort('ip_mode',     'Modo IP') +
+      _thSort('last_updated','Atualizado') +
     '</tr></thead>' +
     '<tbody>' + rows + '</tbody></table></div>';
   document.getElementById('visible-count').textContent = printers.length + ' impressora(s)';
@@ -442,8 +534,10 @@ function makeRow(p) {
   var gwv = fmt(p.gateway); var hnv = fmt(p.hostname); var modev = fmt(p.ip_mode);
   var d1Bad = !!(targetDns1 && d1v && d1v !== targetDns1);
   var d2Bad = !!(targetDns2 && d2v && d2v !== targetDns2);
-  var d1Html   = d1v   ? '<span class="dns-cell' + (d1Bad   ? ' dns-bad' : '') + '">' + esc(d1v)   + '</span>' : '<span class="dns-cell na">\u2014</span>';
-  var d2Html   = d2v   ? '<span class="dns-cell' + (d2Bad   ? ' dns-bad' : '') + '">' + esc(d2v)   + '</span>' : '<span class="dns-cell na">\u2014</span>';
+  var d1Html   = dnsHtml(d1v, d1Bad);
+  var d2Html   = dnsHtml(d2v, d2Bad);
+  // data-dns-status para filtro: 'set'=tem IP, 'notset'=NOT_SET do EWS, 'none'=não coletado
+  var dnsStatus = d1v ? (d1v.toUpperCase().replace(/_| /g,'') === 'NOTSET' ? 'notset' : 'set') : 'none';
   var hnHtml   = hnv   ? '<span class="dns-cell">' + esc(hnv)   + '</span>' : '<span class="dns-cell na">\u2014</span>';
   var gwHtml   = gwv   ? '<span class="dns-cell">' + esc(gwv)   + '</span>' : '<span class="dns-cell na">\u2014</span>';
   var modeHtml = modev ? '<span class="dns-cell">' + esc(modev) + '</span>' : '<span class="dns-cell na">\u2014</span>';
@@ -462,7 +556,8 @@ function makeRow(p) {
          'data-tipo="' + esc(p.tipo||'') + '" ' +
          'data-serial="' + esc((p.serial||'').toLowerCase()) + '" ' +
          'data-modelo="' + esc((p.modelo||'').toLowerCase()) + '" ' +
-         'data-dns1="' + esc(d1v||'') + '" data-dns2="' + esc(d2v||'') + '">' +
+         'data-dns1="' + esc(d1v||'') + '" data-dns2="' + esc(d2v||'') + '" ' +
+         'data-dns-status="' + dnsStatus + '">' +
     '<td>' +
       '<a href="http://' + esc(p.ip) + '/" target="_blank" class="cell-ip" title="Abrir interface web">' + esc(p.ip) + '</a>' +
       '<a href="' + esc(PROBE_BASE) + '/probe?ip=' + esc(p.ip) + '" target="_blank" class="probe-lnk" title="Probe">&#128269;</a>' +
@@ -511,6 +606,8 @@ function applyFilters() {
   var fFab     = document.getElementById('f-fab').value;
   var fTipo    = document.getElementById('f-tipo').value;
   var fSerial  = document.getElementById('f-serial').value.trim().toLowerCase();
+  var fDnsEl   = document.getElementById('f-dns');
+  var fDns     = fDnsEl ? fDnsEl.value : '';
   var dnsOnlyEl = document.getElementById('f-dns-only');
   var fDnsOnly  = dnsOnlyEl && dnsOnlyEl.checked;
   var vis = 0;
@@ -521,10 +618,11 @@ function applyFilters() {
     if (fTipo   && tr.dataset.tipo !== fTipo)                                  show = false;
     if (fSerial && tr.dataset.serial.indexOf(fSerial) === -1
                 && tr.dataset.modelo.indexOf(fSerial) === -1)                  show = false;
+    if (fDns    && tr.dataset.dnsStatus !== fDns)                              show = false;
     if (fDnsOnly && targetDns1) {
       var d1ok = (tr.dataset.dns1 || '') === targetDns1;
       var d2ok = !targetDns2 || (tr.dataset.dns2 || '') === targetDns2;
-      if (d1ok && d2ok) show = false;  // oculta os que já estão corretos
+      if (d1ok && d2ok) show = false;
     }
     tr.classList.toggle('row-hidden', !show);
     if (show) vis++;
@@ -536,6 +634,8 @@ function clearFilters(refilter) {
   ['f-ip','f-serial'].forEach(function(id){document.getElementById(id).value='';});
   document.getElementById('f-fab').value  = '';
   document.getElementById('f-tipo').value = '';
+  var fDns = document.getElementById('f-dns');
+  if (fDns) fDns.value = '';
   var dnsOnly = document.getElementById('f-dns-only');
   if (dnsOnly) dnsOnly.checked = false;
   if (refilter !== false) applyFilters();
