@@ -121,13 +121,20 @@ OID_STD_HOSTNAME      = '1.3.6.1.2.1.1.5.0'              # RFC 1213 sysName
 # HP — SNMP SET (community de escrita)
 SNMP_WRITE_COMMUNITY  = 'public'
 
-# HP — EWS HTTP Basic Auth
-HP_EWS_USER     = 'administrador'
-HP_EWS_PASSWORD = 'simpress1934@'
+# HP — EWS HTTP Basic Auth (tenta múltiplos usuários e senhas)
+HP_EWS_USERS     = ['administrador', 'admin']
+HP_EWS_PASSWORDS = ['simpress1934@', '12345678', '']
+# Compat com código legado que usa as variáveis simples
+HP_EWS_USER     = HP_EWS_USERS[0]
+HP_EWS_PASSWORD = HP_EWS_PASSWORDS[0]
 
 # Samsung SyncThru HTTP
-SAMSUNG_USER     = 'admin'
-SAMSUNG_PASSWORDS = ['sec00000', '1111', 'simpress1934@']
+SAMSUNG_USER      = 'admin'
+SAMSUNG_PASSWORDS = ['sec00000', '1111', 'simpress1934@', '12345678', '3737', '']
+
+# Zebra ZebraNet HTTP
+ZEBRA_USER      = 'admin'
+ZEBRA_PASSWORDS = ['1234', '1934', '3737', '']
 
 # ---- Classificação de fabricantes -----------------------------------------
 KNOWN_MANUFACTURERS   = frozenset({'HP', 'Samsung', 'Zebra', 'Honeywell'})
@@ -466,19 +473,22 @@ def get_network_config(ip: str, manufacturer: str) -> dict:
                     pass
 
     elif manufacturer == 'Samsung':
-        # --- SyncThru JSON ---
-        for path in (
+        # --- SyncThru JSON (tenta sem auth e depois com auth) ---
+        for sws_path in (
             '/sws/app/information/network/networkSetting.json',
             '/sws/swsapi/swsconfig?subtype=networkSetting',
         ):
-            body = _http_get_page(ip, path)
+            body = _http_get_page(ip, sws_path)
+            if not body:
+                for pw in SAMSUNG_PASSWORDS:
+                    body = _http_get_authenticated(ip, sws_path, SAMSUNG_USER, pw)
+                    if body:
+                        break
             if not body:
                 continue
             try:
                 import json as _json
-                data = _json.loads(body)
-                # Estrutura varia por firmware; busca recursiva por campos comuns
-                flat = json.dumps(data)  # noqa: F821 (json importado no outer scope)
+                flat = _json.dumps(_json.loads(body))
                 dns1_m = re.search(r'(?:primaryDns|dns1|preferredDns)["\s:]+([\d.]{7,15})', flat, re.I)
                 dns2_m = re.search(r'(?:secondaryDns|dns2|alternateDns)["\s:]+([\d.]{7,15})', flat, re.I)
                 gw_m   = re.search(r'(?:gateway|defaultGateway)["\s:]+([\d.]{7,15})', flat, re.I)
@@ -496,6 +506,74 @@ def get_network_config(ip: str, manufacturer: str) -> dict:
             except Exception:
                 pass
 
+    # HP Laser 408 e modelos similares usam SyncThru (/sws/) em vez de EWS JetDirect
+    if manufacturer == 'HP' and not result.get('dns1'):
+        for sws_path in (
+            '/sws/app/information/network/networkSetting.json',
+            '/sws/swsapi/swsconfig?subtype=networkSetting',
+        ):
+            body = _http_get_page(ip, sws_path)
+            if not body:
+                for u in HP_EWS_USERS:
+                    for pw in HP_EWS_PASSWORDS:
+                        body = _http_get_authenticated(ip, sws_path, u, pw)
+                        if body:
+                            break
+                    if body:
+                        break
+            if not body:
+                continue
+            try:
+                import json as _json
+                flat = _json.dumps(_json.loads(body))
+                dns1_m = re.search(r'(?:primaryDns|dns1|preferredDns)["\s:]+([\d.]{7,15})', flat, re.I)
+                dns2_m = re.search(r'(?:secondaryDns|dns2|alternateDns)["\s:]+([\d.]{7,15})', flat, re.I)
+                gw_m   = re.search(r'(?:gateway|defaultGateway)["\s:]+([\d.]{7,15})', flat, re.I)
+                hn_m   = re.search(r'(?:hostName|hostname)["\s:]+"([^"]{2,80})"', flat, re.I)
+                dhcp_m = re.search(r'(?:dhcp|ipMode|ipMethod)["\s:]+"?([\w]+)"?', flat, re.I)
+                if dns1_m:
+                    result['dns1']     = dns1_m.group(1)
+                    result['dns2']     = dns2_m.group(1) if dns2_m else None
+                    result['gateway']  = gw_m.group(1)   if gw_m   else result.get('gateway')
+                    result['hostname'] = hn_m.group(1)   if hn_m   else result.get('hostname')
+                    if dhcp_m:
+                        v = dhcp_m.group(1).upper()
+                        result['ip_mode'] = 'DHCP' if 'DHCP' in v or v == 'TRUE' else 'Manual'
+                    break
+            except Exception:
+                pass
+
+    elif manufacturer == 'Zebra':
+        # Hostname via SNMP sysName
+        result['hostname'] = _snmp_get(ip, OID_STD_HOSTNAME)
+        # Gateway via ZebraNet SNMP MIB
+        gw_snmp = _snmp_get(ip, '1.3.6.1.4.1.10642.1.2.3.3.0')
+        if gw_snmp and gw_snmp not in ('0.0.0.0', '0', ''):
+            result['gateway'] = gw_snmp
+        # DNS via HTTP scraping do ZebraNet web (/server/NWSET.htm)
+        for use_https in (False, True):
+            body = _http_get_page(ip, '/server/NWSET.htm', use_https=use_https)
+            if not body:
+                for pw in ZEBRA_PASSWORDS:
+                    body = _http_get_authenticated(ip, '/server/NWSET.htm',
+                                                   ZEBRA_USER, pw, use_https=use_https)
+                    if body:
+                        break
+            if body:
+                d1 = re.search(r'name=["\']?(?:dns1|DNS1|primarydns)["\']?[^>]*?value=["\']([.\d]{7,15})["\']', body, re.I)
+                d2 = re.search(r'name=["\']?(?:dns2|DNS2|secondarydns)["\']?[^>]*?value=["\']([.\d]{7,15})["\']', body, re.I)
+                gw = re.search(r'name=["\']?(?:gw|gateway|defaultgateway)["\']?[^>]*?value=["\']([.\d]{7,15})["\']', body, re.I)
+                if not d1:
+                    d1 = re.search(r'(?i)dns.{0,20}?value=["\']([.\d]{7,15})["\']', body)
+                if d1:
+                    result['dns1'] = d1.group(1)
+                    if d2: result['dns2']    = d2.group(1)
+                    if gw: result['gateway'] = gw.group(1) or result.get('gateway')
+                    break
+        dhcp_oid = _snmp_get(ip, '1.3.6.1.4.1.10642.1.2.3.4.0')
+        if dhcp_oid:
+            result['ip_mode'] = 'DHCP' if dhcp_oid in ('1', 'true', 'dhcp') else 'Manual'
+
     # Limpa strings vazias / zero IPs
     for k in ('dns1', 'dns2', 'gateway'):
         v = result.get(k)
@@ -504,6 +582,35 @@ def get_network_config(ip: str, manufacturer: str) -> dict:
 
     log.debug(f'[netcfg] {ip} → {result}')
     return result
+
+
+def _http_get_authenticated(ip: str, path: str, user: str, password: str,
+                            use_https: bool = False) -> Optional[str]:
+    """GET HTTP com autenticação Basic Auth."""
+    import base64, ssl
+    scheme = 'https' if use_https else 'http'
+    url = f'{scheme}://{ip}{path}'
+    creds = base64.b64encode(f'{user}:{password}'.encode()).decode()
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                'Authorization': f'Basic {creds}',
+                'User-Agent': 'PrinterScanner/1.0',
+            },
+        )
+        if use_https:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=ctx) as r:
+                return r.read(65536).decode('utf-8', errors='ignore')
+        else:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+                return r.read(65536).decode('utf-8', errors='ignore')
+    except Exception as e:
+        log.debug(f'[http_get_auth] {ip}{path} erro: {e}')
+        return None
 
 
 def _snmp_set_string(ip: str, oid: str, value: str) -> bool:
@@ -609,24 +716,39 @@ def apply_dns_config(ip: str, manufacturer: str,
             log.info(f'[apply_dns] {ip} HP SNMP SET ok: {dns1}/{dns2}')
             return result
 
-        # --- Tentativa 2: EWS HTTP (com e sem HTTPS) ---
-        import urllib.parse
+        # --- Tentativa 2: EWS HTTP e SyncThru (multi user/senha, com e sem HTTPS) ---
+        import urllib.parse, json as _json
+        payload_ews = urllib.parse.urlencode({
+            'PreferredDNSServer': dns1, 'AlternateDNSServer': dns2,
+        })
+        payload_sws = _json.dumps({
+            'networkSetting': {'tcpip': {'dns': {'primaryDns': dns1, 'secondaryDns': dns2}}}
+        })
         for use_https in (True, False):
-            # Endpoint para impressoras HP modernas
-            payload = urllib.parse.urlencode({
-                'PreferredDNSServer':  dns1,
-                'AlternateDNSServer':  dns2,
-            })
-            resp = _http_post_authenticated(
-                ip, '/hp/device/IPConfiguration/SetStaticDNS',
-                payload, HP_EWS_USER, HP_EWS_PASSWORD, use_https=use_https)
-            if resp is not None:
-                result = {'ok': True, 'method': f'EWS HTTP{"S" if use_https else ""}',
-                          'detail': f'DNS1={dns1} DNS2={dns2}'}
-                log.info(f'[apply_dns] {ip} HP EWS HTTP ok: {dns1}/{dns2}')
-                return result
+            for u in HP_EWS_USERS:
+                for pw in HP_EWS_PASSWORDS:
+                    # EWS JetDirect
+                    resp = _http_post_authenticated(
+                        ip, '/hp/device/IPConfiguration/SetStaticDNS',
+                        payload_ews, u, pw, use_https=use_https)
+                    if resp is not None:
+                        result = {'ok': True, 'method': f'EWS HTTP{"S" if use_https else ""}',
+                                  'detail': f'DNS1={dns1} DNS2={dns2} user={u}'}
+                        log.info(f'[apply_dns] {ip} HP EWS ok: {dns1}/{dns2}')
+                        return result
+                    # SyncThru (HP Laser 408 etc)
+                    for sws_path in ('/sws/swsapi/swsconfig?subtype=networkSetting',
+                                     '/sws/app/information/network/networkSetting'):
+                        resp = _http_post_authenticated(
+                            ip, sws_path, payload_sws, u, pw,
+                            content_type='application/json', use_https=use_https)
+                        if resp and any(x in resp.lower() for x in ('ok', 'success', 'true')):
+                            result = {'ok': True, 'method': f'SyncThru HTTP{"S" if use_https else ""}',
+                                      'detail': f'DNS1={dns1} DNS2={dns2} user={u}'}
+                            log.info(f'[apply_dns] {ip} HP SyncThru ok: {dns1}/{dns2}')
+                            return result
 
-        result['detail'] = 'SNMP SET sem resposta e EWS HTTP sem resposta — verifique community de escrita e senha EWS'
+        result['detail'] = 'SNMP SET sem resposta, EWS/SyncThru sem resposta — verifique credenciais'
 
     elif manufacturer == 'Samsung':
         import json as _json, urllib.parse
@@ -1055,7 +1177,7 @@ def update_metrics_from_cache(cached: dict) -> dict:
 
     # Configuração de rede: só coleta se ainda não foi coletada antes.
     # Evita overhead no ciclo de update (SNMP+HTTP extra por host).
-    if mfr in ('HP', 'Samsung') and not updated.get('dns1') and not updated.get('hostname'):
+    if mfr in ('HP', 'Samsung', 'Zebra') and not updated.get('dns1') and not updated.get('hostname'):
         netcfg = get_network_config(ip, mfr)
         updated['hostname'] = netcfg.get('hostname') or updated.get('hostname')
         updated['dns1']     = netcfg.get('dns1')     or updated.get('dns1')
@@ -1389,7 +1511,7 @@ def scan_network(entry: dict, known_ips: set[str]) -> list[dict]:
             metrica = get_page_count(host)
 
         netcfg = {}
-        if manufacturer in ('HP', 'Samsung'):
+        if manufacturer in ('HP', 'Samsung', 'Zebra'):
             netcfg = get_network_config(host, manufacturer)
 
         printer = PrinterInfo(
