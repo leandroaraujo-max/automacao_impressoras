@@ -129,6 +129,34 @@ tbody tr:hover { background: #1f2235; }
 .status-online { display: inline-flex; align-items: center; gap: 5px; font-size: .75rem; font-weight: 600; color: #4ade80; }
 .status-online::before { content: ""; width: 6px; height: 6px; background: #4ade80; border-radius: 50%; box-shadow: 0 0 6px #4ade80; }
 .ts-cell { font-size: .68rem; color: #475569; white-space: nowrap; }
+
+/* ---- DNS ---- */
+.dns-cell { font-family: "Cascadia Code", Consolas, monospace; font-size: .78rem; color: #94a3b8; }
+.dns-cell.na { color: #374151; font-style: italic; }
+.dns-bad { color: #f87171 !important; font-weight: 700; }
+td.td-dns-bad { background: rgba(239,68,68,.1); }
+
+/* ---- DNS panel ---- */
+.dns-panel { background: #13161f; border: 1px solid #2d3148; border-radius: 12px; margin-bottom: 16px; overflow: hidden; }
+.dns-panel-hdr { display: flex; align-items: center; gap: 10px; padding: 10px 16px; cursor: pointer; user-select: none; }
+.dns-panel-hdr:hover { background: #1a1d27; }
+.dns-panel-hdr h3 { font-size: .84rem; font-weight: 700; color: #f1f5f9; margin: 0; }
+.dns-badge-ok  { font-size: .7rem; background: #0d2218; border: 1px solid #166534; color: #4ade80; border-radius: 10px; padding: 1px 9px; }
+.dns-badge-bad { font-size: .7rem; background: #2a0a0a; border: 1px solid #7f1d1d; color: #f87171; border-radius: 10px; padding: 1px 9px; }
+.dns-panel-body { border-top: 1px solid #2d3148; padding: 12px 16px 14px; }
+.btn-apply-dns {
+  background: #1a2a4a; border: 1px solid #3b82f6; color: #60a5fa;
+  padding: 6px 14px; border-radius: 7px; font-size: .8rem; font-weight: 600;
+  cursor: pointer; align-self: flex-end; transition: opacity .15s;
+}
+.btn-apply-dns:hover { opacity: .8; }
+.btn-apply-dns:disabled { opacity: .4; cursor: not-allowed; }
+.dns-apply-log {
+  margin-top: 12px; background: #0f1117; border: 1px solid #2d3148;
+  border-radius: 8px; padding: 10px 12px; max-height: 220px; overflow-y: auto;
+  font-family: "Cascadia Code", Consolas, monospace; font-size: .72rem;
+  color: #94a3b8; white-space: pre-wrap; word-break: break-all;
+}
 </style>
 </head>
 <body>
@@ -166,6 +194,7 @@ tbody tr:hover { background: #1f2235; }
     <div class="stat-card"><div class="stat-label">Total</div><div class="stat-value" id="st-total">0</div></div>
     <div class="stat-card"><div class="stat-label">Laser</div><div class="stat-value blue" id="st-laser">0</div></div>
     <div class="stat-card"><div class="stat-label">T&eacute;rmica</div><div class="stat-value amber" id="st-termica">0</div></div>
+    <div class="stat-card" id="st-dns-card" style="display:none"><div class="stat-label">DNS incorreto</div><div class="stat-value" style="color:#f87171" id="st-dns">0</div></div>
   </div>
 
   <div class="filters-bar" id="filters-bar" style="display:none">
@@ -196,7 +225,37 @@ tbody tr:hover { background: #1f2235; }
       <input type="text" id="f-serial" class="filter-input" placeholder="Buscar..." oninput="applyFilters()">
     </div>
     <button class="btn-clear" onclick="clearFilters()">&#10005; Limpar</button>
+    <div class="filter-group" style="flex-direction:row;align-items:center;gap:6px;">
+      <input type="checkbox" id="f-dns-only" onchange="applyFilters()" style="accent-color:#3b82f6;cursor:pointer">
+      <label for="f-dns-only" style="text-transform:none;font-size:.78rem;color:#94a3b8;letter-spacing:0;cursor:pointer">Apenas DNS incorreto</label>
+    </div>
     <span class="visible-count" id="visible-count"></span>
+  </div>
+
+  <!-- ---- DNS Config panel ---- -->
+  <div class="dns-panel" id="dns-panel">
+    <div class="dns-panel-hdr" onclick="toggleDnsPanel()">
+      <h3>&#128337; DNS Alvo</h3>
+      <span id="dns-badge-ok"  class="dns-badge-ok"  style="display:none">Todos OK</span>
+      <span id="dns-badge-bad" class="dns-badge-bad" style="display:none">0 incorretos</span>
+      <span id="dns-panel-arrow" style="margin-left:auto;color:#64748b;font-size:.75rem">&#9660;</span>
+    </div>
+    <div id="dns-panel-body" class="dns-panel-body" style="display:none">
+      <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end">
+        <div class="filter-group">
+          <label>DNS Prim&aacute;rio Alvo</label>
+          <input type="text" id="target-dns1" class="filter-input" placeholder="Ex: 10.0.0.1" oninput="onTargetDnsChange()">
+        </div>
+        <div class="filter-group">
+          <label>DNS Secund&aacute;rio Alvo</label>
+          <input type="text" id="target-dns2" class="filter-input" placeholder="Ex: 10.0.0.2" oninput="onTargetDnsChange()">
+        </div>
+        <button id="btn-apply-dns" class="btn-apply-dns" onclick="applyDnsAction()" disabled>
+          &#9889; Aplicar nos incorretos
+        </button>
+      </div>
+      <div id="dns-apply-log" class="dns-apply-log" style="display:none"></div>
+    </div>
   </div>
 
   <div id="content">
@@ -289,10 +348,12 @@ function showAll() {
 
 // ---- Table ---------------------------------------------------------
 function renderTable(printers) {
+  _currentPrinters = printers || [];
   if (!printers || printers.length === 0) {
     document.getElementById('content').innerHTML =
       '<div class="state-msg"><strong>0</strong>Nenhuma impressora encontrada.</div>';
     document.getElementById('visible-count').textContent = '';
+    _updateDnsBadge([]);
     return;
   }
   var rows = printers.map(makeRow).join('');
@@ -301,10 +362,13 @@ function renderTable(printers) {
     '<thead><tr>' +
       '<th>IP</th><th>Fabricante</th><th>Modelo</th><th>N.\u00ba S\u00e9rie</th>' +
       '<th>Contador / Od\u00f4m.</th><th>Toner</th><th>Kit / Drum</th>' +
-      '<th>Tipo</th><th>Status</th><th>Atualizado</th>' +
+      '<th>Tipo</th><th>Status</th>' +
+      '<th>Hostname</th><th>DNS 1</th><th>DNS 2</th><th>Gateway</th><th>Modo IP</th>' +
+      '<th>Atualizado</th>' +
     '</tr></thead>' +
     '<tbody>' + rows + '</tbody></table></div>';
   document.getElementById('visible-count').textContent = printers.length + ' impressora(s)';
+  _updateDnsBadge(printers);
 }
 
 function makeRow(p) {
@@ -338,10 +402,22 @@ function makeRow(p) {
     ? '<span class="cell-mono">' + esc(serialVal) + '</span>'
     : '<span class="cell-mono na">\u2014</span>';
 
+  // DNS / rede
+  var d1v = fmt(p.dns1); var d2v = fmt(p.dns2);
+  var gwv = fmt(p.gateway); var hnv = fmt(p.hostname); var modev = fmt(p.ip_mode);
+  var d1Bad = !!(targetDns1 && d1v && d1v !== targetDns1);
+  var d2Bad = !!(targetDns2 && d2v && d2v !== targetDns2);
+  var d1Html   = d1v   ? '<span class="dns-cell' + (d1Bad   ? ' dns-bad' : '') + '">' + esc(d1v)   + '</span>' : '<span class="dns-cell na">\u2014</span>';
+  var d2Html   = d2v   ? '<span class="dns-cell' + (d2Bad   ? ' dns-bad' : '') + '">' + esc(d2v)   + '</span>' : '<span class="dns-cell na">\u2014</span>';
+  var hnHtml   = hnv   ? '<span class="dns-cell">' + esc(hnv)   + '</span>' : '<span class="dns-cell na">\u2014</span>';
+  var gwHtml   = gwv   ? '<span class="dns-cell">' + esc(gwv)   + '</span>' : '<span class="dns-cell na">\u2014</span>';
+  var modeHtml = modev ? '<span class="dns-cell">' + esc(modev) + '</span>' : '<span class="dns-cell na">\u2014</span>';
+
   return '<tr data-ip="' + esc(p.ip) + '" data-fab="' + esc(p.fabricante||'') + '" ' +
          'data-tipo="' + esc(p.tipo||'') + '" ' +
          'data-serial="' + esc((p.serial||'').toLowerCase()) + '" ' +
-         'data-modelo="' + esc((p.modelo||'').toLowerCase()) + '">' +
+         'data-modelo="' + esc((p.modelo||'').toLowerCase()) + '" ' +
+         'data-dns1="' + esc(d1v||'') + '" data-dns2="' + esc(d2v||'') + '">' +
     '<td>' +
       '<a href="http://' + esc(p.ip) + '/" target="_blank" class="cell-ip" title="Abrir interface web">' + esc(p.ip) + '</a>' +
       '<a href="' + esc(PROBE_BASE) + '/probe?ip=' + esc(p.ip) + '" target="_blank" class="probe-lnk" title="Probe">&#128269;</a>' +
@@ -354,6 +430,11 @@ function makeRow(p) {
     '<td>' + c2Html + '</td>' +
     '<td><span class="tipo-badge ' + tipoClass + '">' + tipoLabel + '</span></td>' +
     '<td><span class="status-online">Online</span></td>' +
+    '<td>' + hnHtml + '</td>' +
+    '<td class="' + (d1Bad ? 'td-dns-bad' : '') + '">' + d1Html + '</td>' +
+    '<td class="' + (d2Bad ? 'td-dns-bad' : '') + '">' + d2Html + '</td>' +
+    '<td>' + gwHtml + '</td>' +
+    '<td>' + modeHtml + '</td>' +
     '<td class="ts-cell">' + esc(fmtDate(p.last_updated)) + '</td>' +
   '</tr>';
 }
@@ -361,17 +442,31 @@ function makeRow(p) {
 function updateStats(printers) {
   var laser   = printers.filter(function(p){return p.tipo==='laser';}).length;
   var termica = printers.filter(function(p){return p.tipo==='termica';}).length;
+  var dnsBad = 0;
+  if (targetDns1) {
+    dnsBad = printers.filter(function(p) {
+      if (p.fabricante !== 'HP' && p.fabricante !== 'Samsung') return false;
+      var ok1 = p.dns1 === targetDns1;
+      var ok2 = !targetDns2 || p.dns2 === targetDns2;
+      return !ok1 || !ok2;
+    }).length;
+  }
   document.getElementById('st-total').textContent   = printers.length;
   document.getElementById('st-laser').textContent   = laser;
   document.getElementById('st-termica').textContent = termica;
+  document.getElementById('st-dns').textContent     = dnsBad;
+  document.getElementById('st-dns-card').style.display = targetDns1 ? '' : 'none';
+  _updateDnsBadge(printers);
 }
 
 // ---- Filters -------------------------------------------------------
 function applyFilters() {
-  var fIp     = document.getElementById('f-ip').value.trim().toLowerCase();
-  var fFab    = document.getElementById('f-fab').value;
-  var fTipo   = document.getElementById('f-tipo').value;
-  var fSerial = document.getElementById('f-serial').value.trim().toLowerCase();
+  var fIp      = document.getElementById('f-ip').value.trim().toLowerCase();
+  var fFab     = document.getElementById('f-fab').value;
+  var fTipo    = document.getElementById('f-tipo').value;
+  var fSerial  = document.getElementById('f-serial').value.trim().toLowerCase();
+  var dnsOnlyEl = document.getElementById('f-dns-only');
+  var fDnsOnly  = dnsOnlyEl && dnsOnlyEl.checked;
   var vis = 0;
   document.querySelectorAll('#content tbody tr').forEach(function(tr) {
     var show = true;
@@ -380,6 +475,11 @@ function applyFilters() {
     if (fTipo   && tr.dataset.tipo !== fTipo)                                  show = false;
     if (fSerial && tr.dataset.serial.indexOf(fSerial) === -1
                 && tr.dataset.modelo.indexOf(fSerial) === -1)                  show = false;
+    if (fDnsOnly && targetDns1) {
+      var d1ok = (tr.dataset.dns1 || '') === targetDns1;
+      var d2ok = !targetDns2 || (tr.dataset.dns2 || '') === targetDns2;
+      if (d1ok && d2ok) show = false;  // oculta os que já estão corretos
+    }
     tr.classList.toggle('row-hidden', !show);
     if (show) vis++;
   });
@@ -390,12 +490,110 @@ function clearFilters(refilter) {
   ['f-ip','f-serial'].forEach(function(id){document.getElementById(id).value='';});
   document.getElementById('f-fab').value  = '';
   document.getElementById('f-tipo').value = '';
+  var dnsOnly = document.getElementById('f-dns-only');
+  if (dnsOnly) dnsOnly.checked = false;
   if (refilter !== false) applyFilters();
 }
 
 // ---- Init ----------------------------------------------------------
 buildCdList();
 if (ALL_CDS.length === 1) selectCd(ALL_CDS[0]);
+
+// ---- DNS config globals & helpers ----------------------------------
+var targetDns1       = '';
+var targetDns2       = '';
+var _currentPrinters = [];
+
+function _updateDnsBadge(printers) {
+  var badEl = document.getElementById('dns-badge-bad');
+  var okEl  = document.getElementById('dns-badge-ok');
+  if (!badEl || !okEl) return;
+  if (!targetDns1) { badEl.style.display = 'none'; okEl.style.display = 'none'; return; }
+  var bad = printers.filter(function(p) {
+    if (p.fabricante !== 'HP' && p.fabricante !== 'Samsung') return false;
+    return p.dns1 !== targetDns1 || (targetDns2 && p.dns2 !== targetDns2);
+  }).length;
+  if (bad > 0) {
+    badEl.textContent   = bad + ' incorreto' + (bad > 1 ? 's' : '');
+    badEl.style.display = ''; okEl.style.display = 'none';
+  } else {
+    okEl.style.display = ''; badEl.style.display = 'none';
+  }
+}
+
+function onTargetDnsChange() {
+  targetDns1 = (document.getElementById('target-dns1').value || '').trim();
+  targetDns2 = (document.getElementById('target-dns2').value || '').trim();
+  document.getElementById('btn-apply-dns').disabled = !targetDns1;
+  if (_currentPrinters.length) {
+    renderTable(_currentPrinters);
+    updateStats(_currentPrinters);
+    applyFilters();
+  }
+}
+
+function toggleDnsPanel() {
+  var body  = document.getElementById('dns-panel-body');
+  var arrow = document.getElementById('dns-panel-arrow');
+  if (body.style.display === 'none') {
+    body.style.display = ''; arrow.innerHTML = '&#9650;';
+  } else {
+    body.style.display = 'none'; arrow.innerHTML = '&#9660;';
+  }
+}
+
+function applyDnsAction() {
+  var dns1 = (document.getElementById('target-dns1').value || '').trim();
+  var dns2 = (document.getElementById('target-dns2').value || '').trim();
+  if (!dns1) { alert('Informe o DNS Primário Alvo.'); return; }
+
+  var ips = [];
+  document.querySelectorAll('#content tbody tr:not(.row-hidden)').forEach(function(tr) {
+    var fab = tr.dataset.fab;
+    if (fab !== 'HP' && fab !== 'Samsung') return;
+    var d1ok = (tr.dataset.dns1 || '') === dns1;
+    var d2ok = !dns2 || (tr.dataset.dns2 || '') === dns2;
+    if (!d1ok || !d2ok) ips.push(tr.dataset.ip);
+  });
+  if (!ips.length) { alert('Nenhuma impressora visível com DNS incorreto.'); return; }
+
+  var logEl = document.getElementById('dns-apply-log');
+  logEl.style.display = '';
+  logEl.textContent = '\u21bb Aplicando DNS em ' + ips.length + ' impressora(s)...\n';
+  document.getElementById('btn-apply-dns').disabled = true;
+
+  fetch('/api/apply-dns', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({dns1: dns1, dns2: dns2, ips: ips})
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(data) {
+    var msg = 'Resultado: ' + data.ok + '/' + data.total + ' OK, ' + data.failed + ' falhou\n';
+    (data.results || []).forEach(function(r) {
+      msg += (r.ok ? '\u2713' : '\u2717') + ' ' + r.ip
+           + ' [' + (r.fabricante || '') + '] \u2014 '
+           + (r.detail || r.method || '') + '\n';
+    });
+    logEl.textContent = msg;
+    document.getElementById('btn-apply-dns').disabled = false;
+    // Atualiza dados locais e re-renderiza
+    (data.results || []).forEach(function(r) {
+      if (r.ok) {
+        _currentPrinters.forEach(function(p) {
+          if (p.ip === r.ip) { p.dns1 = dns1; p.dns2 = dns2; }
+        });
+      }
+    });
+    renderTable(_currentPrinters);
+    updateStats(_currentPrinters);
+    applyFilters();
+  })
+  .catch(function(e) {
+    logEl.textContent = 'Erro: ' + String(e);
+    document.getElementById('btn-apply-dns').disabled = false;
+  });
+}
 
 // ---- Scan status polling -------------------------------------------
 var _autoRefreshTimer = null;
