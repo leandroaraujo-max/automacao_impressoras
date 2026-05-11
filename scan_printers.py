@@ -1786,6 +1786,52 @@ def _register_routes(flask_app, req, jsonify_fn, render_tmpl):
             'printers':     report,
         })
 
+    @flask_app.route('/api/export-csv')
+    def api_export_csv():
+        """Exporta todas as impressoras do cache como CSV.
+
+        Parâmetros opcionais:
+          ?cd=350          — filtra por filial
+          ?fabricante=HP   — filtra por fabricante
+        """
+        import csv, io
+        cache = load_cache()
+        printers = list(cache.values())
+
+        f_cd  = req.args.get('cd', '').strip()
+        f_fab = req.args.get('fabricante', '').strip().upper()
+        if f_cd:
+            printers = [p for p in printers if str(p.get('filial', '')) == f_cd]
+        if f_fab:
+            printers = [p for p in printers if (p.get('fabricante') or '').upper() == f_fab]
+
+        printers.sort(key=lambda p: (str(p.get('filial', '')).zfill(6), p.get('ip', '')))
+
+        fields = ['ip', 'filial', 'fabricante', 'modelo', 'serial', 'tipo',
+                  'metrica', 'toner', 'consumivel2',
+                  'hostname', 'dns1', 'dns2', 'gateway', 'ip_mode',
+                  'status', 'first_seen', 'last_updated', 'dns_apply_status']
+
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=fields, extrasaction='ignore',
+                                lineterminator='\r\n')
+        writer.writeheader()
+        for p in printers:
+            writer.writerow({f: (p.get(f) or '') for f in fields})
+
+        from flask import Response as FlaskResponse
+        cd_suffix = f'_CD{f_cd}' if f_cd else ''
+        fab_suffix = f'_{f_fab}' if f_fab else ''
+        filename = f'impressoras{cd_suffix}{fab_suffix}.csv'
+        return FlaskResponse(
+            buf.getvalue().encode('utf-8-sig'),   # BOM para Excel
+            mimetype='text/csv',
+            headers={
+                'Content-Disposition': f'attachment; filename="{filename}"',
+                'Content-Type': 'text/csv; charset=utf-8',
+            }
+        )
+
     @flask_app.route('/api/apply-dns', methods=['POST'])
     def api_apply_dns():
         """Aplica DNS em uma ou mais impressoras.
