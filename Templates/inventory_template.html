@@ -210,9 +210,15 @@ td.td-dns-bad { background: rgba(239,68,68,.1); }
 .btn-mc-cancel  { background:#1a1d27; border-color:#2d3148; color:#64748b; }
 .btn-mc-confirm { background:#1a3060; border-color:#3b82f6; color:#60a5fa; }
 .btn-mc:disabled { opacity:.4; cursor:not-allowed; }
-.modal-status { font-size:.77rem; color:#94a3b8; margin-top:10px; min-height:18px; }
+.modal-status { font-size:.77rem; color:#94a3b8; margin-top:10px; min-height:18px; line-height:1.5; }
 .modal-status.ok   { color:#4ade80; }
 .modal-status.fail { color:#f87171; }
+/* Banner de aviso quando aberto como file:// sem Flask */
+.flask-warn { background:#2a1500; border:1px solid #92400e; border-radius:9px;
+  padding:10px 16px; margin-bottom:14px; font-size:.8rem; color:#fbbf24;
+  display:none; line-height:1.6; }
+.flask-warn code { background:#1a0f00; padding:1px 6px; border-radius:3px;
+  font-family:"Cascadia Code",Consolas,monospace; font-size:.78rem; }
 </style>
 </head>
 <body>
@@ -235,6 +241,15 @@ td.td-dns-bad { background: rgba(239,68,68,.1); }
 
 <!-- ======= MAIN ======= -->
 <main class="main">
+  <!-- Aviso exibido quando inventory.html é aberto como file:// sem Flask -->
+  <div class="flask-warn" id="flask-warn">
+    &#9888; Voc&ecirc; est&aacute; visualizando este invent&aacute;rio <strong>offline</strong> (sem o servidor Flask).
+    As seguintes fun&ccedil;&otilde;es <strong>n&atilde;o funcionam</strong> neste modo:
+    exportar CSV &middot; aplicar DNS &middot; modal de credenciais &middot; probe de conectividade.<br>
+    Para habilit&aacute;-las, inicie o servidor e acesse pelo navegador:<br>
+    <code>python scan_printers.py --probe-only</code> &nbsp;&rarr;&nbsp;
+    <a href="http://127.0.0.1:$PROBE_PORT/results" target="_blank" style="color:#fbbf24">http://127.0.0.1:$PROBE_PORT/results</a>
+  </div>
   <div class="topbar">
     <h1 id="main-title">&#128424; Selecione um CD</h1>
     <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
@@ -859,10 +874,24 @@ function submitCredentials() {
     }
   })
   .catch(function(e) {
-    s.textContent = 'Erro de rede: ' + String(e);
+    var msg = String(e);
+    if (msg.indexOf('fetch') !== -1 || msg.indexOf('NetworkError') !== -1 || msg.indexOf('Failed') !== -1) {
+      s.innerHTML = '\u26a0\ufe0f O servidor Flask n\u00e3o est\u00e1 rodando ou n\u00e3o est\u00e1 acess\u00edvel.<br>'
+        + '<small style="color:#94a3b8">Execute: <code style="background:#0f1117;padding:1px 5px;border-radius:3px">python scan_printers.py --probe-only</code>'
+        + '<br>Depois abra este invent\u00e1rio pelo servidor: '
+        + '<a href="' + PROBE_BASE + '/results" target="_blank" style="color:#60a5fa">' + PROBE_BASE + '/results</a></small>';
+    } else {
+      s.textContent = 'Erro: ' + msg;
+    }
     s.className = 'modal-status fail';
   })
   .finally(function() { btn.disabled = false; btn.textContent = 'Salvar e Testar'; });
+}
+
+// Detecta abertura como file:// e exibe aviso
+if (location.protocol === 'file:') {
+  var fw = document.getElementById('flask-warn');
+  if (fw) fw.style.display = 'block';
 }
 
 _pollStatus();

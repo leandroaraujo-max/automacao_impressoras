@@ -497,8 +497,17 @@ def get_network_config(ip: str, manufacturer: str) -> dict:
             ip_mode = mode_map.get(raw_mode, f'Codigo {raw_mode}')
         else:
             ip_mode = raw_mode
-        result.update({'hostname': hn, 'dns1': d1 or None,
-                       'dns2': d2 or None, 'gateway': gw, 'ip_mode': ip_mode})
+        # Aceita apenas IPs reais do SNMP.
+        # 'NOT_SET' indica DNS nao configurado manualmente (DHCP) — nao bloqueia
+        # o fallback EWS JSON, que pode retornar o IP DHCP real atribuido.
+        _IP_RE = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
+        _snmp_notset = bool(d1 and str(d1).strip().upper() in ('NOT_SET', 'NOTSET', 'NOT SET'))
+        result.update({
+            'hostname': hn,
+            'dns1':    d1 if (d1 and _IP_RE.match(d1.strip())) else None,
+            'dns2':    d2 if (d2 and _IP_RE.match(d2.strip())) else None,
+            'gateway': gw, 'ip_mode': ip_mode,
+        })
 
         # --- Fallback EWS JSON (HP tradicionais) ---
         if not result['dns1']:
@@ -596,6 +605,12 @@ def get_network_config(ip: str, manufacturer: str) -> dict:
         v = result.get(k)
         if v in (None, '', '0.0.0.0', '0'):
             result[k] = None
+
+    # Se HP esgotou todos os fallbacks HTTP e o SNMP havia confirmado 'NOT_SET'
+    # (DNS nao configurado manualmente), grava o marcador para evitar re-tentativa
+    # desnecessaria em ciclos futuros quando auth_ok ja for False.
+    if manufacturer == 'HP' and not result.get('dns1') and _snmp_notset:
+        result['dns1'] = 'NOT_SET'
 
     log.debug(f'[netcfg] {ip} -> {result}')
     return result
@@ -1210,9 +1225,16 @@ def update_metrics_from_cache(cached: dict) -> dict:
     else:
         updated['metrica'] = get_page_count(ip)
 
-    # Configuração de rede: coleta se dns1 ainda não foi obtido.
-    # Corrigido: checa apenas dns1 (hostname pode existir sem dns via SNMP).
-    if mfr in ('HP', 'Samsung', 'Zebra') and not updated.get('dns1'):
+    # Configuração de rede — lógica de retry:
+    # - IP real      → pula (já tem)
+    # - None         → sempre tenta (nunca coletado)
+    # - 'NOT_SET'    → tenta SE auth_ok nao for False (DHCP + HTTP já falhou = esgotado)
+    _dns1_now  = str(updated.get('dns1') or '').strip().upper()
+    _dns_is_ip = bool(re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', _dns1_now))
+    _dns_notset = _dns1_now in ('NOT_SET', 'NOTSET', 'NOT SET')
+    _auth_done  = updated.get('auth_ok') is False
+    _retry_dns  = not _dns_is_ip and not (_dns_notset and _auth_done)
+    if mfr in ('HP', 'Samsung', 'Zebra') and _retry_dns:
         netcfg = get_network_config(ip, mfr)
         updated['hostname'] = netcfg.get('hostname') or updated.get('hostname')
         updated['dns1']     = netcfg.get('dns1')     or updated.get('dns1')
