@@ -10,15 +10,16 @@ Kit de automação para inventário e diagnóstico de impressoras distribuídas 
 2. [Estrutura do Projeto](#-estrutura-do-projeto)
 3. [Uso Rápido](#-uso-rápido)
 4. [Controle de Acesso](#-controle-de-acesso)
-5. [Funcionalidades](#-funcionalidades)
-6. [Fluxo de Execução](#-fluxo-de-execução)
-7. [API Flask — Referência de Rotas](#-api-flask--referência-de-rotas)
-8. [Modelo de Dados](#-modelo-de-dados--printerinfo)
-9. [Referência de OIDs SNMP](#-referência-de-oids-snmp)
-10. [CSV de Endereçamento](#-csv-de-endereçamento)
-11. [Constantes Configuráveis](#-constantes-configuráveis)
-12. [Referência de Funções](#-referência-de-funções)
-13. [Acesso de Rede e Firewall](#-acesso-de-rede-e-firewall)
+5. [Configuração via .env](#-configuração-via-env)
+6. [Funcionalidades](#-funcionalidades)
+7. [Fluxo de Execução](#-fluxo-de-execução)
+8. [API Flask — Referência de Rotas](#-api-flask--referência-de-rotas)
+9. [Modelo de Dados](#-modelo-de-dados--printerinfo)
+10. [Referência de OIDs SNMP](#-referência-de-oids-snmp)
+11. [CSV de Endereçamento](#-csv-de-endereçamento)
+12. [Constantes Configuráveis](#-constantes-configuráveis)
+13. [Referência de Funções](#-referência-de-funções)
+14. [Acesso de Rede e Firewall](#-acesso-de-rede-e-firewall)
 
 ---
 
@@ -121,6 +122,7 @@ C:\Users\_araujo\AppData\Local\Python\pythoncore-3.14-64\python.exe -m pip insta
 | `pandas` | 3.0.2 | **Sim** | Leitura e parsing do CSV de endereçamento de redes por CD |
 | `python-nmap` | 0.7.1 | **Sim** | Wrapper Python do executável `nmap`; realiza scan de portas 80/443/631/9100 em cada rede CIDR |
 | `pysnmp` | 7.1.26 | Recomendado | SNMP GET de alto nível via `pysnmp.hlapi`; o script possui fallback BER puro-Python se não instalado |
+| `python-dotenv` | 1.x | Recomendado | Carrega variáveis do arquivo `.env`; sem ele, apenas variáveis de ambiente do SO são usadas |
 
 > **Sobre o `pysnmp`:** Sem ele, o script usa uma implementação SNMP própria em Python puro (`_snmp_get_raw`). O fallback funciona para a maioria dos casos, mas pode ter comportamentos diferentes com impressoras que usam variantes não-padrão do protocolo SNMP v1. **Recomenda-se instalar o `pysnmp`.**
 
@@ -178,6 +180,9 @@ Antes de executar o scanner pela primeira vez, confirme que os seguintes arquivo
 | Arquivo | Obrigatório | Descrição |
 |---------|------------|-----------|
 | `scan_printers.py` | **Sim** | Script principal |
+| `config.py` | **Sim** | Centraliza constantes e carrega `.env` |
+| `.env` | Não (usa defaults) | Variáveis de configuração locais — não versionar |
+| `.env.example` | — | Template de `.env` versionável — copiar para `.env` |
 | `Redes Imps CDS/Endereçamento_Atualizado.csv` | **Sim** | CSV com redes CIDR por CD |
 | `Templates/inventory_template.html` | **Sim** | Template do inventário estático |
 | `Templates/probe.html` | **Sim** | Página de diagnóstico individual |
@@ -227,7 +232,11 @@ nmap -sU -p 161 10.70.82.10
 ```
 Impressoras/
 ├── scan_printers.py                     # Backend principal — scanner + API Flask
+├── config.py                            # Configuração centralizada — carrega .env
+├── .env                                 # Variáveis de ambiente locais (não versionado)
+├── .env.example                         # Template de configuração (versionado)
 ├── admin.key                            # Senha do painel admin (texto simples; criado automaticamente)
+├── automacao.log                        # Log rotativo gerado em runtime (não versionado)
 ├── cache.json                           # Cache incremental (gerado automaticamente)
 ├── inventory.html                       # Inventário HTML gerado (gerado automaticamente)
 ├── printer_credentials.json             # Credenciais manuais por IP (gerado automaticamente)
@@ -264,6 +273,41 @@ Após iniciar, acesse:
 - **Diagnóstico:** `http://localhost:5001/probe`
 
 > O servidor Flask fica disponível em `http://0.0.0.0:5001`. Para acesso de outras máquinas da rede, veja a seção [Acesso de Rede e Firewall](#-acesso-de-rede-e-firewall).
+
+Endpoints adicionais:
+- **Healthcheck:** `http://localhost:5001/healthcheck` — verifica saúde do servidor
+
+---
+
+## ⚙️ Configuração via .env
+
+Todas as constantes configuráveis (porta, senhas, timeouts) são carregadas pelo `config.py` a partir do arquivo `.env` na pasta do projeto. Sem o arquivo `.env`, são usados os valores padrão.
+
+### Configuração inicial
+
+```powershell
+# Copie o template e edite com seus valores
+copy .env.example .env
+notepad .env
+```
+
+### Variáveis disponíveis
+
+| Variável | Padrão | Descrição |
+|----------|--------|-----------|
+| `PROBE_PORT` | `5001` | Porta do servidor Flask |
+| `SNMP_COMMUNITY` | `public` | Community SNMP read-only |
+| `HTTP_TIMEOUT` | `3` | Timeout HTTP em segundos |
+| `SNMP_TIMEOUT` | `2` | Timeout SNMP em segundos |
+| `MAX_CONCURRENT` | `10` | Scans nmap paralelos |
+| `HP_EWS_USERS` | `administrador,admin` | Usuários EWS HP separados por vírgula |
+| `HP_EWS_PASSWORDS` | `simpress1934@,12345678,` | Senhas EWS HP separadas por vírgula |
+| `SAMSUNG_USER` | `admin` | Usuário SyncThru Samsung |
+| `SAMSUNG_PASSWORDS` | `sec00000,1111,...` | Senhas Samsung separadas por vírgula |
+| `ZEBRA_USER` | `admin` | Usuário ZebraNet |
+| `ZEBRA_PASSWORDS` | `1234,1934,3737,` | Senhas Zebra separadas por vírgula |
+
+> O arquivo `.env` nunca deve ser versionado — está no `.gitignore`. Use `.env.example` como referência.
 
 ---
 
@@ -426,6 +470,7 @@ python scan_printers.py
 | Método | Rota | Perfil | Descrição |
 |--------|------|--------|-----------|
 | `GET` | `/api/status` | Público | JSON com status do scan (`running`, `total`, `networks_done`, etc.) |
+| `GET` | `/healthcheck` | Público | JSON com saúde do servidor: `ok`, `version`, `uptime_s`, `scan_running`, `cache_size` |
 | `GET` | `/api/cds` | Público | JSON com lista de CDs disponíveis no cache |
 | `GET` | `/api/cd/<cd>` | Público | JSON com impressoras de um CD específico |
 | `GET` | `/api/probe?ip=<ip>` | Público | JSON com diagnóstico completo (portas TCP, HTTP, OIDs SNMP) |
@@ -610,40 +655,23 @@ cd "C:\Projetos\Impressoras\Redes Imps CDS"
 
 Abra `scan_printers.py` e ajuste as constantes no topo do arquivo conforme o ambiente:
 
-| Constante | Valor padrão | Descrição |
-|-----------|-------------|-----------|
+As constantes configuráveis são definidas em `config.py` e lidas do arquivo `.env`. Consulte a seção [Configuração via .env](#-configuração-via-env) para ajustar os valores.
+
+Constantes **fixas no código** (não configuráveis por `.env`):
+
+| Constante | Valor | Descrição |
+|-----------|-------|-----------|
 | `ADMIN_KEY_PATH` | `admin.key` | Arquivo com a senha do painel admin |
 | `CSV_PATH` | `Redes Imps CDS/Endereçamento_Atualizado.csv` | Arquivo de redes por CD |
 | `CACHE_PATH` | `cache.json` | Cache incremental de impressoras |
 | `CREDENTIALS_PATH` | `printer_credentials.json` | Credenciais manuais por IP |
 | `INVENTORY_PATH` | `inventory.html` | Saída HTML gerada |
 | `TEMPLATE_PATH` | `Templates/inventory_template.html` | Template do inventário |
-| `PROBE_PORT` | `5001` | Porta do servidor Flask |
-| `SNMP_COMMUNITY` | `public` | Community SNMP read-only |
 | `SNMP_WRITE_COMMUNITY` | `public` | Community SNMP para SNMP SET (aplicação de DNS) |
-| `SNMP_TIMEOUT` | `2` (segundos) | Timeout por OID SNMP |
-| `HTTP_TIMEOUT` | `3` (segundos) | Timeout por requisição HTTP |
 | `NMAP_ARGS` | `-p 80,443,631,9100 --open -T4` | Argumentos do scan nmap |
-| `MAX_CONCURRENT` | `10` | Semáforo de scans nmap paralelos |
 | `ZEBRA_DEFAULT_DPI` | `203` | DPI padrão Zebra para conversão dot→polegada |
 
-### Credenciais de autenticação HTTP
-
-```python
-# HP — EWS Basic Auth (tentadas em ordem)
-HP_EWS_USERS     = ['administrador', 'admin']
-HP_EWS_PASSWORDS = ['simpress1934@', '12345678', '']
-
-# Samsung SyncThru
-SAMSUNG_USER      = 'admin'
-SAMSUNG_PASSWORDS = ['sec00000', '1111', 'simpress1934@', '12345678', '3737', '']
-
-# Zebra ZebraNet
-ZEBRA_USER      = 'admin'
-ZEBRA_PASSWORDS = ['1234', '1934', '3737', '']
-```
-
-> Credenciais salvas manualmente via modal (`printer_credentials.json`) têm **prioridade sobre estas listas** — são inseridas no início da fila de tentativas para o IP correspondente.
+> Credenciais salvas manualmente via modal (`printer_credentials.json`) têm **prioridade sobre as listas do `.env`** — são inseridas no início da fila de tentativas para o IP correspondente.
 
 ---
 
@@ -696,6 +724,13 @@ ZEBRA_PASSWORDS = ['1234', '1934', '3737', '']
 | `save_printer_credentials(creds)` | Salva `printer_credentials.json` |
 | `_load_admin_password()` | Lê `admin.key`; cria com senha `admin` na primeira execução |
 | `_check_admin_password(pw)` | Compara senha com `hmac.compare_digest` (timing-safe) |
+
+### Qualidade e resiliência
+
+| Função | Descrição |
+|--------|----------|
+| `_with_retry(fn, attempts, base_delay)` | Executa `fn()` até 3 vezes com backoff exponencial (1s→2s→4s ±20% jitter); erros HTTP 4xx não são retriados |
+| `_setup_file_logging()` | Adiciona `RotatingFileHandler` ao logger raiz → `automacao.log` (5 MB, 3 backups) |
 
 ### Diagnóstico (probe)
 
@@ -752,8 +787,12 @@ Após criar a regra, o inventário fica acessível em:
 cd "C:\Projetos\Impressoras"
 python -m py_compile scan_printers.py && Write-Host "SYNTAX OK"
 
+# Verificar healthcheck após iniciar o servidor
+curl http://localhost:5001/healthcheck
+# {"ok": true, "version": "1.0", "uptime_s": 5, "scan_running": false, "cache_size": 120}
+
 # Git — commit e push
-git add scan_printers.py Templates/inventory_template.html
+git add scan_printers.py config.py .env.example .gitignore Templates/inventory_template.html
 git commit -m "mensagem"
 git push origin main
 ```
