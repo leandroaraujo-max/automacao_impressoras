@@ -940,7 +940,296 @@ def _samsung_syncthru_set_dns(ip: str, user: str, password: str,
     return False
 
 
-# Nomes conhecidos de campos DNS no EWS HP (ordem de prioridade decrescente).
+# ---------------------------------------------------------------------------
+# Strategy: Adaptadores de DNS por fabricante
+# ---------------------------------------------------------------------------
+
+class VendorAdapter:
+    """Interface base para aplicar DNS em um fabricante específico."""
+
+    def apply_dns(self, ip: str, dns1: str, dns2: str) -> dict:
+        raise NotImplementedError
+
+
+class _HPAdapter(VendorAdapter):
+    def apply_dns(self, ip: str, dns1: str, dns2: str) -> dict:
+        import urllib.parse, json as _json
+
+        # Tentativa 1: SNMP SET JetDirect
+        ok1 = _snmp_set_string(ip, OID_HP_DNS_PRIMARY,   dns1)
+        ok2 = _snmp_set_string(ip, OID_HP_DNS_SECONDARY, dns2)
+        if ok1 and ok2:
+            log.info(f'[apply_dns] {ip} HP SNMP SET ok: {dns1}/{dns2}')
+            return {'ok': True, 'method': 'SNMP SET JetDirect',
+                    'detail': f'DNS1={dns1} DNS2={dns2}'}
+
+        # Tentativa 2: EWS HTTP (network_id.htm, SetStaticDNS, SyncThru)
+        payload_ews = urllib.parse.urlencode({
+            'PreferredDNSServer': dns1, 'AlternateDNSServer': dns2,
+        })
+        payload_sws = _json.dumps({
+            'networkSetting': {'tcpip': {'dns': {'primaryDns': dns1, 'secondaryDns': dns2}}}
+        })
+        for use_https in (True, False):
+            for u in HP_EWS_USERS:
+                for pw in HP_EWS_PASSWORDS:
+                    # network_id.htm — HP E-series (confirmado E60165)
+                    if _hp_network_id_apply_dns(ip, dns1, dns2, u, pw, use_https=use_https):
+                        log.info(f'[apply_dns] {ip} HP network_id.htm ok: {dns1}/{dns2}')
+                        return {'ok': True,
+                                'method': f'network_id.htm HTTP{"S" if use_https else ""}',
+                                'detail': f'DNS1={dns1} DNS2={dns2} user={u}'}
+                    # EWS SetStaticDNS (LaserJet Pro/Enterprise clássico)
+                    resp = _http_post_authenticated(
+                        ip, '/hp/device/IPConfiguration/SetStaticDNS',
+                        payload_ews, u, pw, use_https=use_https)
+                    if resp is not None:
+                        verify = _http_get_authenticated(
+                            ip, '/network_id.htm', u, pw, use_https=use_https)
+                        if verify and dns1 in verify:
+                            log.info(f'[apply_dns] {ip} HP EWS SetStaticDNS ok: {dns1}/{dns2}')
+                            return {'ok': True,
+                                    'method': f'EWS SetStaticDNS HTTP{"S" if use_https else ""}',
+                                    'detail': f'DNS1={dns1} DNS2={dns2} user={u}'}
+                        log.debug(f'[apply_dns] {ip} SetStaticDNS POST respondeu mas '
+                                  f'DNS não mudou (use_https={use_https})')
+                    # SyncThru (HP Laser 408 / Samsung-based)
+                    for sws_path in ('/sws/swsapi/swsconfig?subtype=networkSetting',
+                                     '/sws/app/information/network/networkSetting'):
+                        resp2 = _http_post_authenticated(
+                            ip, sws_path, payload_sws, u, pw,
+                            content_type='application/json', use_https=use_https)
+                        if resp2 and any(x in resp2.lower()
+                                         for x in ('ok', 'success', 'true')):
+                            log.info(f'[apply_dns] {ip} HP SyncThru ok: {dns1}/{dns2}')
+                            return {'ok': True,
+                                    'method': f'SyncThru HTTP{"S" if use_https else ""}',
+                                    'detail': f'DNS1={dns1} DNS2={dns2} user={u}'}
+
+        detail = ('SNMP SET falhou; EWS/network_id.htm: campos DNS não identificados '
+                  'ou POST rejeitado — verifique credenciais, HTTPS e versão de firmware')
+        log.warning(f'[apply_dns] {ip} HP FALHOU: {detail}')
+        return {'ok': False, 'method': '', 'detail': detail}
+
+
+class _SamsungAdapter(VendorAdapter):
+    def apply_dns(self, ip: str, dns1: str, dns2: str) -> dict:
+        _saved = load_printer_credentials().get(ip, {})
+        _candidates: list = []
+        if _saved.get('password'):
+            _candidates.append((_saved.get('user', SAMSUNG_USER), _saved['password']))
+        for pw in SAMSUNG_PASSWORDS:
+            entry = (SAMSUNG_USER, pw)
+            if entry not in _candidates:
+                _candidates.append(entry)
+
+        for use_https in (False, True):
+            for user, password in _candidates:
+                if _samsung_syncthru_set_dns(ip, user, password, dns1, dns2,
+                                             use_https=use_https):
+                    log.info(f'[apply_dns] {ip} Samsung SyncThru ok: {dns1}/{dns2}')
+                    return {'ok': True,
+                            'method': f'SyncThru {"HTTPS" if use_https else "HTTP"} (sessão)',
+                            'detail': f'DNS1={dns1} DNS2={dns2} user={user}'}
+
+        detail = ('SyncThru sem confirmação — verifique se o payload '
+                  'foi aceito manualmente em http://' + ip + '/sws')
+        log.warning(f'[apply_dns] {ip} Samsung FALHOU: {detail}')
+        return {'ok': False, 'method': '', 'detail': detail}
+
+
+class _ZebraAdapter(VendorAdapter):
+    """Aplica DNS na Zebra: SGD setvar (primário) → HTTP /server/NWSET.htm (fallback)."""
+
+    def apply_dns(self, ip: str, dns1: str, dns2: str) -> dict:
+        import re as _re, urllib.parse as _up
+
+        # --- Tentativa 1: SGD nativo porta 9100 ---
+        ok_sgd = False
+        _zebra_sgd(ip, f'! U1 setvar "internal_wired.ip.dns1" "{dns1}"')
+        _zebra_sgd(ip, f'! U1 setvar "internal_wired.ip.dns2" "{dns2}"')
+        # Verifica resultado relendo os valores
+        got1 = _zebra_sgd(ip, '! U1 getvar "internal_wired.ip.dns1"')
+        got2 = _zebra_sgd(ip, '! U1 getvar "internal_wired.ip.dns2"')
+        if got1 and got1.strip('"') == dns1:
+            ok_sgd = True
+            log.info(f'[apply_dns] {ip} Zebra SGD ok: {dns1}/{dns2}')
+            return {'ok': True, 'method': 'SGD setvar',
+                    'detail': f'DNS1={dns1} DNS2={dns2}'}
+        log.debug(f'[zebra_dns] {ip} SGD: got1={got1!r} got2={got2!r} — '
+                  f'tentando HTTP fallback')
+
+        # --- Tentativa 2: HTTP GET-parse-POST /server/NWSET.htm ---
+        _saved = load_printer_credentials().get(ip, {})
+        _z_user = _saved.get('user', ZEBRA_USER)
+        _z_pwds = ([_saved['password']] if _saved.get('password') else []) + ZEBRA_PASSWORDS
+
+        for use_https in (False, True):
+            for pw in _z_pwds:
+                import http.cookiejar as _cj, base64 as _b64
+                scheme = 'https' if use_https else 'http'
+                creds  = _b64.b64encode(f'{_z_user}:{pw}'.encode()).decode()
+                hdrs   = {'Authorization': f'Basic {creds}',
+                          'User-Agent': 'PrinterScanner/1.0',
+                          'Referer': f'{scheme}://{ip}/server/NWSET.htm'}
+                cj     = _cj.CookieJar()
+                opener = urllib.request.build_opener(
+                    urllib.request.HTTPSHandler(context=_SSL_CTX),
+                    urllib.request.HTTPCookieProcessor(cj),
+                )
+                # GET
+                try:
+                    req = urllib.request.Request(
+                        f'{scheme}://{ip}/server/NWSET.htm', headers=hdrs)
+                    with opener.open(req, timeout=HTTP_TIMEOUT + 3) as r:
+                        html = r.read(32768).decode('utf-8', 'ignore')
+                except Exception as e:
+                    log.debug(f'[zebra_dns] {ip} GET /server/NWSET.htm falhou '
+                              f'(https={use_https}): {e}')
+                    continue
+
+                # Extrai campos do formulário
+                form_m    = _re.search(r'<form[^>]+action=["\']([^"\']+)["\']',
+                                       html, _re.IGNORECASE)
+                post_path = form_m.group(1) if form_m else '/server/NWSET.htm'
+                fields: dict = {}
+                for m in _re.finditer(r'<input([^>]*)>', html, _re.IGNORECASE):
+                    a  = m.group(1)
+                    nm = _re.search(r"""name=['"]([^'"]+)['"]""", a, _re.IGNORECASE)
+                    vl = _re.search(r"""value=['"]([^'"]*?)['"]""", a, _re.IGNORECASE)
+                    tp = _re.search(r"""type=['"]([^'"]+?)['"]""", a, _re.IGNORECASE)
+                    chk = _re.search(r'\bchecked\b', a, _re.IGNORECASE)
+                    if not nm:
+                        continue
+                    name  = nm.group(1)
+                    value = vl.group(1) if vl else ''
+                    ftype = (tp.group(1) or '').lower() if tp else 'text'
+                    if ftype == 'submit':
+                        if name not in fields:
+                            fields[name] = value
+                        continue
+                    if ftype == 'checkbox':
+                        if chk:
+                            fields[name] = value or 'on'
+                        continue
+                    if ftype == 'radio':
+                        if chk:
+                            fields[name] = value
+                        elif name not in fields:
+                            fields[name] = value
+                        continue
+                    fields[name] = value
+
+                if not fields:
+                    continue
+
+                # Identifica campos DNS por padrão de nome
+                _dns1_candidates = ['dns1', 'DNS1', 'primarydns', 'primaryDNS',
+                                    'PreferredDNS', 'dns_primary']
+                _dns2_candidates = ['dns2', 'DNS2', 'secondarydns', 'secondaryDNS',
+                                    'AlternateDNS', 'dns_secondary']
+                dns1_field = next(
+                    (n for n in _dns1_candidates if n in fields), None)
+                dns2_field = next(
+                    (n for n in _dns2_candidates if n in fields), None)
+                # Fallback: campos com valor IP atual
+                if not dns1_field or not dns2_field:
+                    _ip_pat = _re.compile(r'^\d{1,3}(?:\.\d{1,3}){3}$')
+                    ip_fields = [(k, v) for k, v in fields.items()
+                                 if _ip_pat.match(v or '') and 'gateway' not in k.lower()
+                                 and 'wins' not in k.lower()]
+                    if not dns1_field and len(ip_fields) >= 1:
+                        dns1_field = ip_fields[0][0]
+                    if not dns2_field and len(ip_fields) >= 2:
+                        dns2_field = ip_fields[1][0]
+
+                if not dns1_field:
+                    log.debug(f'[zebra_dns] {ip} campos DNS não identificados '
+                              f'em /server/NWSET.htm: {list(fields.keys())}')
+                    continue
+
+                if dns1_field:
+                    fields[dns1_field] = dns1
+                if dns2_field:
+                    fields[dns2_field] = dns2
+
+                # POST
+                post_hdrs = dict(hdrs)
+                post_hdrs['Content-Type'] = 'application/x-www-form-urlencoded'
+                req2 = urllib.request.Request(
+                    f'{scheme}://{ip}{post_path}',
+                    data=_up.urlencode(fields).encode(),
+                    headers=post_hdrs,
+                    method='POST',
+                )
+                try:
+                    with opener.open(req2, timeout=HTTP_TIMEOUT + 3) as r:
+                        _ = r.read(4096)
+                except Exception as e:
+                    log.debug(f'[zebra_dns] {ip} POST {post_path} falhou: {e}')
+                    continue
+
+                # Verificação pós-POST via re-GET
+                try:
+                    req3 = urllib.request.Request(
+                        f'{scheme}://{ip}/server/NWSET.htm', headers=hdrs)
+                    with opener.open(req3, timeout=HTTP_TIMEOUT + 3) as r:
+                        verify = r.read(32768).decode('utf-8', 'ignore')
+                    if verify and dns1 in verify:
+                        log.info(f'[apply_dns] {ip} Zebra HTTP NWSET.htm ok: {dns1}/{dns2}')
+                        return {'ok': True,
+                                'method': f'HTTP NWSET.htm {"HTTPS" if use_https else "HTTP"}',
+                                'detail': f'DNS1={dns1} DNS2={dns2} user={_z_user}'}
+                    log.debug(f'[zebra_dns] {ip} verificação pós-POST falhou: '
+                              f'{dns1!r} não encontrado')
+                except Exception as e:
+                    log.debug(f'[zebra_dns] {ip} GET de verificação falhou: {e}')
+
+        detail = 'SGD setvar falhou; HTTP /server/NWSET.htm: POST rejeitado ou DNS não confirmado'
+        log.warning(f'[apply_dns] {ip} Zebra FALHOU: {detail}')
+        return {'ok': False, 'method': '', 'detail': detail}
+
+
+class _GenericAdapter(VendorAdapter):
+    def __init__(self, name: str = 'Desconhecido') -> None:
+        self._name = name
+
+    def apply_dns(self, ip: str, dns1: str, dns2: str) -> dict:
+        detail = f'Fabricante {self._name!r} sem suporte a apply_dns automatizado'
+        log.warning(f'[apply_dns] {ip} {detail}')
+        return {'ok': False, 'method': '', 'detail': detail}
+
+
+# Registry: mapeia fabricante → adaptador (instâncias singleton)
+VENDOR_ADAPTERS: dict = {
+    'HP':        _HPAdapter(),
+    'Samsung':   _SamsungAdapter(),
+    'Zebra':     _ZebraAdapter(),
+    'Honeywell': _GenericAdapter('Honeywell'),
+}
+_DEFAULT_ADAPTER = _GenericAdapter()
+
+
+def apply_dns_config(ip: str, manufacturer: str,
+                     dns1: str, dns2: str) -> dict:
+    """Aplica DNS primário e secundário no equipamento via adaptador do fabricante.
+
+    HP:
+      1. SNMP SET JetDirect (OIDs 29/30)
+      2. EWS HTTP: network_id.htm → SetStaticDNS → SyncThru
+    Samsung:
+      SyncThru /sws/ via sessão autenticada
+    Zebra:
+      1. SGD setvar porta 9100
+      2. HTTP GET-parse-POST /server/NWSET.htm (fallback)
+    Outros: retorna ok=False sem I/O
+
+    Retorna dict {'ok': bool, 'method': str, 'detail': str}
+    """
+    adapter = VENDOR_ADAPTERS.get(manufacturer, _DEFAULT_ADAPTER)
+    return adapter.apply_dns(ip, dns1, dns2)
+
+
 # Obtidos por engenharia reversa das páginas network_id.htm em múltiplos firmwares.
 # Confirmados em produção:
 #   'IPv4_DnsServerId'      — HP LaserJet E60165 / E52645 (E-series)
@@ -1114,118 +1403,6 @@ def _hp_network_id_apply_dns(ip: str, dns1: str, dns2: str,
     return False
 
 
-def apply_dns_config(ip: str, manufacturer: str,
-                     dns1: str, dns2: str) -> dict:
-    """Aplica DNS primário e secundário no equipamento.
-
-    HP:
-      1. SNMP SET JetDirect (OIDs 29/30) — mais universal
-      2. Fallback EWS HTTP POST /hp/device/IPConfiguration/SetStaticDNS
-    Samsung:
-      1. HTTP POST SyncThru /sws/swsapi/swsconfig?subtype=networkSetting
-         com credenciais (tenta todas as senhas conhecidas)
-
-    Retorna dict {'ok': bool, 'method': str, 'detail': str}
-    """
-    result = {'ok': False, 'method': '', 'detail': ''}
-
-    if manufacturer == 'HP':
-        # --- Tentativa 1: SNMP SET ---
-        ok1 = _snmp_set_string(ip, OID_HP_DNS_PRIMARY,   dns1)
-        ok2 = _snmp_set_string(ip, OID_HP_DNS_SECONDARY, dns2)
-        if ok1 and ok2:
-            result = {'ok': True, 'method': 'SNMP SET JetDirect',
-                      'detail': f'DNS1={dns1} DNS2={dns2}'}
-            log.info(f'[apply_dns] {ip} HP SNMP SET ok: {dns1}/{dns2}')
-            return result
-
-        # --- Tentativa 2: EWS HTTP, network_id.htm e SyncThru ---
-        import urllib.parse, json as _json
-
-        # EWS SetStaticDNS (HP LaserJet tradicionais)
-        payload_ews = urllib.parse.urlencode({
-            'PreferredDNSServer': dns1, 'AlternateDNSServer': dns2,
-        })
-        # SyncThru (HP Laser 408 e similares Samsung-based HP)
-        payload_sws = _json.dumps({
-            'networkSetting': {'tcpip': {'dns': {'primaryDns': dns1, 'secondaryDns': dns2}}}
-        })
-        for use_https in (True, False):
-            for u in HP_EWS_USERS:
-                for pw in HP_EWS_PASSWORDS:
-                    # network_id.htm — HP LaserJet E60165 / E series
-                    # Usa GET-parse-POST-verify para garantir campos corretos
-                    if _hp_network_id_apply_dns(ip, dns1, dns2, u, pw, use_https=use_https):
-                        result = {'ok': True, 'method': f'network_id.htm HTTP{"S" if use_https else ""}',
-                                  'detail': f'DNS1={dns1} DNS2={dns2} user={u}'}
-                        log.info(f'[apply_dns] {ip} HP network_id.htm ok: {dns1}/{dns2}')
-                        return result
-                    # EWS JetDirect SetStaticDNS (HP LaserJet Pro/Enterprise clássico)
-                    # Verifica resultado via re-leitura de network_id.htm
-                    resp = _http_post_authenticated(
-                        ip, '/hp/device/IPConfiguration/SetStaticDNS',
-                        payload_ews, u, pw, use_https=use_https)
-                    if resp is not None:
-                        verify = _http_get_authenticated(ip, '/network_id.htm', u, pw, use_https=use_https)
-                        if verify and dns1 in verify:
-                            result = {'ok': True, 'method': f'EWS SetStaticDNS HTTP{"S" if use_https else ""}',
-                                      'detail': f'DNS1={dns1} DNS2={dns2} user={u}'}
-                            log.info(f'[apply_dns] {ip} HP EWS SetStaticDNS ok: {dns1}/{dns2}')
-                            return result
-                        log.debug(f'[apply_dns] {ip} SetStaticDNS POST respondeu mas DNS não mudou (use_https={use_https})')
-                    # SyncThru (HP Laser 408 etc)
-                    for sws_path in ('/sws/swsapi/swsconfig?subtype=networkSetting',
-                                     '/sws/app/information/network/networkSetting'):
-                        resp = _http_post_authenticated(
-                            ip, sws_path, payload_sws, u, pw,
-                            content_type='application/json', use_https=use_https)
-                        if resp and any(x in resp.lower() for x in ('ok', 'success', 'true')):
-                            result = {'ok': True, 'method': f'SyncThru HTTP{"S" if use_https else ""}',
-                                      'detail': f'DNS1={dns1} DNS2={dns2} user={u}'}
-                            log.info(f'[apply_dns] {ip} HP SyncThru ok: {dns1}/{dns2}')
-                            return result
-
-        result['detail'] = 'SNMP SET falhou; EWS/network_id.htm: campos DNS não identificados ou POST rejeitado — verifique credenciais, HTTPS e versão de firmware'
-
-    elif manufacturer == 'Samsung':
-        import json as _json, urllib.parse
-        payload_dict = {
-            'networkSetting': {
-                'tcpip': {'dns': {'primaryDns': dns1, 'secondaryDns': dns2}}
-            }
-        }
-        payload_json = _json.dumps(payload_dict)
-
-        # Credenciais salvas para este IP têm prioridade
-        _saved = load_printer_credentials().get(ip, {})
-        _candidates: list = []
-        if _saved.get('password'):
-            _candidates.append((_saved.get('user', SAMSUNG_USER), _saved['password']))
-        for pw in SAMSUNG_PASSWORDS:
-            entry = (SAMSUNG_USER, pw)
-            if entry not in _candidates:
-                _candidates.append(entry)
-
-        for use_https in (False, True):
-            for user, password in _candidates:
-                # Usa auth por sessão (cookie) — correto para SyncThru ML/SL series
-                if _samsung_syncthru_set_dns(ip, user, password, dns1, dns2,
-                                             use_https=use_https):
-                    result = {'ok': True,
-                              'method': f'SyncThru {"HTTPS" if use_https else "HTTP"} (sessão)',
-                              'detail': f'DNS1={dns1} DNS2={dns2} user={user}'}
-                    log.info(f'[apply_dns] {ip} Samsung SyncThru ok: {dns1}/{dns2}')
-                    return result
-        result['detail'] = ('SyncThru sem confirmação — verifique se o payload '
-                            'foi aceito manualmente em http://' + ip + '/sws')
-
-    else:
-        result['detail'] = f'Fabricante {manufacturer!r} sem suporte a apply_dns automatizado'
-
-    log.warning(f'[apply_dns] {ip} FALHOU: {result["detail"]}')
-    return result
-
-
 def get_page_count(ip: str) -> Optional[str]:
     """Contador de páginas — tenta HP XML, depois SNMP padrão."""
     import re, xml.etree.ElementTree as ET
@@ -1251,12 +1428,29 @@ def get_page_count(ip: str) -> Optional[str]:
 def get_zebra_odometer(ip: str) -> Optional[str]:
     """Odômetro da cabeça térmica Zebra em polegadas.
 
+    0. SGD porta 9100 — odometer.total_print_length (ZT/ZD firmware moderno)
     1. HTTP /server/SYSINFO.htm — Head Mileage (ZT/ZD series)
     2. HTTP /server/CFGPAGE.htm — Config page
     3. SNMP OID Eltron (polegadas, modelos GK/LP/legado)
     4. SNMP OID ZebraNet dot count ÷ DPI
     """
     import re
+
+    # --- Tentativa 0: SGD nativo (firmware ZT/ZD/ZC moderno) ---
+    sgd_raw = _zebra_sgd(ip, '! U1 getvar "odometer.total_print_length"')
+    if sgd_raw:
+        sgd_clean = sgd_raw.strip().lstrip('"').rstrip('"').replace(',', '')
+        if sgd_clean.lstrip('-').isdigit():
+            val_int = int(sgd_clean)
+            if val_int > 0:
+                # Heurística: valor > 50 000 → provável dots; caso contrário polegadas
+                if val_int > 50_000:
+                    inches = val_int // ZEBRA_DEFAULT_DPI
+                else:
+                    inches = val_int
+                if 0 < inches < 5_000_000:
+                    return f'{inches:,} pol.'
+
     for path in ('/server/SYSINFO.htm', '/server/CFGPAGE.htm'):
         body = _http_get_page(ip, path)
         if not body:
@@ -1292,6 +1486,48 @@ def get_zebra_odometer(ip: str) -> Optional[str]:
             return f'{dots // ZEBRA_DEFAULT_DPI:,} pol.'
 
     return None
+
+
+def _zebra_sgd(ip: str, command: str, timeout: float = 4.0) -> Optional[str]:
+    """Envia um comando SGD para a Zebra via socket TCP porta 9100.
+
+    Comandos típicos:
+      getvar: '! U1 getvar "internal_wired.ip.dns1"'
+      setvar: '! U1 setvar "internal_wired.ip.dns1" "172.30.2.13"'
+      odom:   '! U1 getvar "odometer.total_print_length"'
+
+    Retorna a resposta como string (sem aspas externas) ou None em caso de erro.
+    """
+    import socket as _sock
+    try:
+        s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            s.connect((ip, 9100))
+            s.sendall((command + '\r\n').encode('ascii', errors='replace'))
+            # Lê até 256 bytes ou timeout
+            buf = b''
+            try:
+                while len(buf) < 256:
+                    chunk = s.recv(256 - len(buf))
+                    if not chunk:
+                        break
+                    buf += chunk
+            except _sock.timeout:
+                pass
+        finally:
+            s.close()
+        if not buf:
+            return None
+        text = buf.decode('ascii', errors='ignore').strip()
+        # Remove aspas externas que a Zebra inclui na resposta de getvar
+        if text.startswith('"') and text.endswith('"'):
+            text = text[1:-1]
+        log.debug(f'[zebra_sgd] {ip} cmd={command!r} -> {text!r}')
+        return text or None
+    except Exception as e:
+        log.debug(f'[zebra_sgd] {ip} erro: {e}')
+        return None
 
 
 def _decode_html(s: str) -> str:
@@ -2343,7 +2579,7 @@ def _register_routes(flask_app, req, jsonify_fn, render_tmpl):
         report = []
         for p in cache.values():
             mfr = p.get('fabricante', '')
-            if mfr not in ('HP', 'Samsung'):
+            if mfr not in VENDOR_ADAPTERS:
                 continue
             dns1_ok = (p.get('dns1') == target_dns1) if target_dns1 else None
             dns2_ok = (p.get('dns2') == target_dns2) if target_dns2 else None
@@ -2556,11 +2792,6 @@ def _register_routes(flask_app, req, jsonify_fn, render_tmpl):
                                     'detail': 'IP não encontrado no cache'})
                 return
             mfr = p.get('fabricante', '')
-            if mfr not in ('HP', 'Samsung'):
-                with lock_apply:
-                    results.append({'ip': ip, 'ok': False,
-                                    'detail': f'Fabricante {mfr!r} sem suporte'})
-                return
             try:
                 r = apply_dns_config(ip, mfr, dns1, dns2)
             except Exception as _exc:
