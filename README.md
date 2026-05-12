@@ -760,10 +760,14 @@ Constantes **fixas no código** (não configuráveis por `.env`):
 
 ## 🔒 Acesso de Rede e Firewall
 
-O Flask escuta em `0.0.0.0:8080` para aceitar conexões de qualquer IP. Para permitir acesso de outras máquinas:
+O Flask escuta em `0.0.0.0:8080` para aceitar conexões de qualquer IP. A regra de firewall abaixo é **obrigatória** para acesso de outras máquinas na rede (ex.: rede Magalu a partir de outro PC).
+
+> **Estado atual:** A regra já foi criada na máquina de produção (`Scanner Impressoras — Flask 8080`, porta TCP 8080, Profile Any, Enabled: True).
+
+### Criar ou recriar a regra
 
 ```powershell
-# Criar regra de firewall — executar como Administrador
+# Executar como Administrador
 New-NetFirewallRule `
   -DisplayName "Scanner Impressoras — Flask 8080" `
   -Direction Inbound `
@@ -771,9 +775,19 @@ New-NetFirewallRule `
   -LocalPort 8080 `
   -Action Allow `
   -Profile Any
+```
 
-# Verificar se a regra foi criada
-Get-NetFirewallRule -DisplayName "Scanner Impressoras*" | Select-Object DisplayName, Enabled, Direction
+### Verificar regras existentes
+
+```powershell
+Get-NetFirewallRule -DisplayName "Scanner Impressoras*" | Select-Object DisplayName, Enabled, Direction, Action
+```
+
+### Remover regras antigas (porta anterior 5001)
+
+```powershell
+# Caso exista regra da porta antiga, remover
+Remove-NetFirewallRule -DisplayName "Scanner Impressoras — Flask 5001" -ErrorAction SilentlyContinue
 ```
 
 Após criar a regra, o inventário fica acessível em:
