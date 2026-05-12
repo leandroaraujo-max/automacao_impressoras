@@ -940,6 +940,180 @@ def _samsung_syncthru_set_dns(ip: str, user: str, password: str,
     return False
 
 
+# Nomes conhecidos de campos DNS no EWS HP (ordem de prioridade decrescente).
+# Obtidos por engenharia reversa das páginas network_id.htm em múltiplos firmwares.
+# Confirmados em produção:
+#   'IPv4_DnsServerId'      — HP LaserJet E60165 / E52645 (E-series)
+#   'IPv4_Sec_DnsServerId'  — HP LaserJet E60165 / E52645 (E-series)
+_HP_DNS1_FIELD_NAMES = [
+    'IPv4_DnsServerId',      # HP E60165 / E52645 — CONFIRMADO em produção
+    'IPv4DNSAddress1',       # variante E-series
+    'dns1_cfg',              # Pro M series
+    'PreferredDNSServer',    # LaserJet clássico (SetStaticDNS)
+    'primaryDNS',
+    'dnsServer1',
+    'DNS1',
+    'dns1',
+    'iPv4DNS1',
+    'pDNS',
+]
+_HP_DNS2_FIELD_NAMES = [
+    'IPv4_Sec_DnsServerId',  # HP E60165 / E52645 — CONFIRMADO em produção
+    'IPv4DNSAddress2',
+    'dns2_cfg',
+    'AlternateDNSServer',    # LaserJet clássico (SetStaticDNS)
+    'secondaryDNS',
+    'dnsServer2',
+    'DNS2',
+    'dns2',
+    'iPv4DNS2',
+    'sDNS',
+]
+
+
+def _hp_network_id_apply_dns(ip: str, dns1: str, dns2: str,
+                              user: str, password: str,
+                              use_https: bool = False) -> bool:
+    """Aplica DNS no HP EWS via GET-parse-POST-verify em /network_id.htm.
+
+    Fluxo:
+      1. GET autenticado da página com CookieJar (mantém sessionId do HP EWS)
+      2. Extrai <form action=...> para obter o URL correto de POST
+      3. Extrai campos do formulário:
+         - Inclui hidden, text, radio (selecionado), checkbox (só se checked)
+         - Inclui apenas o primeiro botão Apply (descarta Delete/Cancel/etc.)
+         - CSRFToken hidden é incluído automaticamente
+      4. Substitui os campos de DNS pelos valores alvo
+      5. POST para o endpoint do form com session cookie + Basic Auth + Referer
+      6. Re-GET para verificar que os novos DNS aparecem na página
+    Retorna True somente se a verificação pós-POST confirmar a mudança.
+    """
+    import re as _re, urllib.parse as _up, http.cookiejar as _cj, base64 as _b64
+
+    scheme = 'https' if use_https else 'http'
+    creds  = _b64.b64encode(f'{user}:{password}'.encode()).decode()
+    hdrs   = {'Authorization': f'Basic {creds}', 'User-Agent': 'Mozilla/5.0',
+              'Referer': f'{scheme}://{ip}/network_id.htm'}
+
+    # Opener com CookieJar para manter o sessionId do HP EWS
+    cj     = _cj.CookieJar()
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=_SSL_CTX),
+        urllib.request.HTTPCookieProcessor(cj),
+    )
+
+    # 1. GET — obtém o HTML do formulário e o cookie de sessão
+    try:
+        req = urllib.request.Request(f'{scheme}://{ip}/network_id.htm', headers=hdrs)
+        with opener.open(req, timeout=HTTP_TIMEOUT + 3) as r:
+            html = r.read(65536).decode('utf-8', 'ignore')
+    except Exception as e:
+        log.debug(f'[hp_net_id] {ip} GET falhou (use_https={use_https}): {e}')
+        return False
+
+    # 2. Extrai a URL de POST do atributo ACTION do <form>
+    form_m  = _re.search(r'<form[^>]+action=["\']([^"\']+)["\']', html, _re.IGNORECASE)
+    post_path = form_m.group(1) if form_m else '/network_id.htm/config'
+
+    # 3. Extrai campos do formulário com tratamento correto de tipos
+    _APPLY_NAMES = {'Apply', 'Appli', 'apply', 'submit', 'OK'}
+    fields: dict[str, str] = {}
+    for m in _re.finditer(r'<input([^>]*)>', html, _re.IGNORECASE):
+        a   = m.group(1)
+        nm  = _re.search(r"""name=['"]([^'"]+)['"]""", a, _re.IGNORECASE)
+        vl  = _re.search(r"""value=['"]([^'"]*?)['"]""", a, _re.IGNORECASE)
+        tp  = _re.search(r"""type=['"]([^'"]+?)['"]""", a, _re.IGNORECASE)
+        chk = _re.search(r'\bchecked\b', a, _re.IGNORECASE)
+        if not nm:
+            continue
+        name  = nm.group(1)
+        value = vl.group(1) if vl else ''
+        ftype = (tp.group(1) or '').lower() if tp else 'text'
+        if ftype == 'submit':
+            if name in _APPLY_NAMES and name not in fields:
+                fields[name] = value
+            continue
+        if ftype == 'checkbox':
+            if chk:
+                fields[name] = value or 'on'
+            # checkbox não marcado: NÃO inclui (causa 400 no HP EWS)
+            continue
+        if ftype == 'radio':
+            if chk:
+                fields[name] = value
+            elif name not in fields:
+                fields[name] = value  # fallback: primeiro radio
+            continue
+        fields[name] = value
+
+    if not fields:
+        log.debug(f'[hp_net_id] {ip} nenhum campo de formulário encontrado (use_https={use_https})')
+        return False
+
+    # 4. Identifica campos DNS por nome
+    dns1_field = next((n for n in _HP_DNS1_FIELD_NAMES if n in fields), None)
+    dns2_field = next((n for n in _HP_DNS2_FIELD_NAMES if n in fields), None)
+
+    # Fallback: procura campos cujo valor atual é um endereço IP
+    # (heurística para firmwares com nomes de campo desconhecidos)
+    if not dns1_field or not dns2_field:
+        _ip_pat = _re.compile(r'^\d{1,3}(?:\.\d{1,3}){3}$')
+        # Só considera os primeiros campos IP (evita pegar WINS/gateway)
+        ip_fields = [(k, v) for k, v in fields.items()
+                     if _ip_pat.match(v or '') and 'wins' not in k.lower()
+                     and 'gateway' not in k.lower()]
+        log.debug(f'[hp_net_id] {ip} campos com valor IP: {ip_fields}')
+        if not dns1_field and len(ip_fields) >= 1:
+            dns1_field = ip_fields[0][0]
+        if not dns2_field and len(ip_fields) >= 2:
+            dns2_field = ip_fields[1][0]
+
+    if not dns1_field and not dns2_field:
+        log.debug(f'[hp_net_id] {ip} campos DNS não identificados. '
+                  f'Campos: {list(fields.keys())}')
+        return False
+
+    log.debug(f'[hp_net_id] {ip} campos DNS: {dns1_field!r}/{dns2_field!r} '
+              f'action={post_path!r}')
+
+    if dns1_field:
+        fields[dns1_field] = dns1
+    if dns2_field:
+        fields[dns2_field] = dns2
+
+    # 5. POST com session cookie + Basic Auth + Referer
+    payload = _up.urlencode(fields)
+    post_hdrs = dict(hdrs)
+    post_hdrs['Content-Type'] = 'application/x-www-form-urlencoded'
+    req2 = urllib.request.Request(
+        f'{scheme}://{ip}{post_path}',
+        data=payload.encode(),
+        headers=post_hdrs,
+        method='POST',
+    )
+    try:
+        with opener.open(req2, timeout=HTTP_TIMEOUT + 3) as r:
+            _ = r.read(4096)  # lê body para liberar conexão
+    except Exception as e:
+        log.debug(f'[hp_net_id] {ip} POST {post_path} falhou: {e}')
+        return False
+
+    # 6. Re-GET para verificar que os novos valores de DNS aparecem na página
+    try:
+        req3 = urllib.request.Request(f'{scheme}://{ip}/network_id.htm', headers=hdrs)
+        with opener.open(req3, timeout=HTTP_TIMEOUT + 3) as r:
+            verify = r.read(65536).decode('utf-8', 'ignore')
+        if verify and dns1 in verify:
+            log.info(f'[hp_net_id] {ip} DNS verificado: {dns1}/{dns2} '
+                     f'(campo={dns1_field} action={post_path})')
+            return True
+        log.debug(f'[hp_net_id] {ip} verificação pós-POST falhou: '
+                  f'{dns1!r} não encontrado na resposta')
+    except Exception as e:
+        log.debug(f'[hp_net_id] {ip} GET de verificação falhou: {e}')
+    return False
+
+
 def apply_dns_config(ip: str, manufacturer: str,
                      dns1: str, dns2: str) -> dict:
     """Aplica DNS primário e secundário no equipamento.
@@ -972,14 +1146,6 @@ def apply_dns_config(ip: str, manufacturer: str,
         payload_ews = urllib.parse.urlencode({
             'PreferredDNSServer': dns1, 'AlternateDNSServer': dns2,
         })
-        # network_id.htm — pagina de identificacao de rede HP E60165 e similares
-        # Tenta varios nomes de campo comuns usados pelo EWS desta geracao
-        payload_netid_v1 = urllib.parse.urlencode({
-            'primaryDNS': dns1, 'secondaryDNS': dns2,
-        })
-        payload_netid_v2 = urllib.parse.urlencode({
-            'dnsServer1': dns1, 'dnsServer2': dns2,
-        })
         # SyncThru (HP Laser 408 e similares Samsung-based HP)
         payload_sws = _json.dumps({
             'networkSetting': {'tcpip': {'dns': {'primaryDns': dns1, 'secondaryDns': dns2}}}
@@ -987,25 +1153,26 @@ def apply_dns_config(ip: str, manufacturer: str,
         for use_https in (True, False):
             for u in HP_EWS_USERS:
                 for pw in HP_EWS_PASSWORDS:
-                    # EWS JetDirect (HP LaserJet Pro/Enterprise classico)
+                    # network_id.htm — HP LaserJet E60165 / E series
+                    # Usa GET-parse-POST-verify para garantir campos corretos
+                    if _hp_network_id_apply_dns(ip, dns1, dns2, u, pw, use_https=use_https):
+                        result = {'ok': True, 'method': f'network_id.htm HTTP{"S" if use_https else ""}',
+                                  'detail': f'DNS1={dns1} DNS2={dns2} user={u}'}
+                        log.info(f'[apply_dns] {ip} HP network_id.htm ok: {dns1}/{dns2}')
+                        return result
+                    # EWS JetDirect SetStaticDNS (HP LaserJet Pro/Enterprise clássico)
+                    # Verifica resultado via re-leitura de network_id.htm
                     resp = _http_post_authenticated(
                         ip, '/hp/device/IPConfiguration/SetStaticDNS',
                         payload_ews, u, pw, use_https=use_https)
                     if resp is not None:
-                        result = {'ok': True, 'method': f'EWS HTTP{"S" if use_https else ""}',
-                                  'detail': f'DNS1={dns1} DNS2={dns2} user={u}'}
-                        log.info(f'[apply_dns] {ip} HP EWS ok: {dns1}/{dns2}')
-                        return result
-                    # network_id.htm — HP LaserJet E60165 / E series
-                    for nid_payload in (payload_netid_v1, payload_netid_v2):
-                        resp = _http_post_authenticated(
-                            ip, '/network_id.htm',
-                            nid_payload, u, pw, use_https=use_https)
-                        if resp is not None and len(resp) > 50:
-                            result = {'ok': True, 'method': f'network_id.htm HTTP{"S" if use_https else ""}',
+                        verify = _http_get_authenticated(ip, '/network_id.htm', u, pw, use_https=use_https)
+                        if verify and dns1 in verify:
+                            result = {'ok': True, 'method': f'EWS SetStaticDNS HTTP{"S" if use_https else ""}',
                                       'detail': f'DNS1={dns1} DNS2={dns2} user={u}'}
-                            log.info(f'[apply_dns] {ip} HP network_id.htm ok: {dns1}/{dns2}')
+                            log.info(f'[apply_dns] {ip} HP EWS SetStaticDNS ok: {dns1}/{dns2}')
                             return result
+                        log.debug(f'[apply_dns] {ip} SetStaticDNS POST respondeu mas DNS não mudou (use_https={use_https})')
                     # SyncThru (HP Laser 408 etc)
                     for sws_path in ('/sws/swsapi/swsconfig?subtype=networkSetting',
                                      '/sws/app/information/network/networkSetting'):
@@ -1018,7 +1185,7 @@ def apply_dns_config(ip: str, manufacturer: str,
                             log.info(f'[apply_dns] {ip} HP SyncThru ok: {dns1}/{dns2}')
                             return result
 
-        result['detail'] = 'SNMP SET falhou (community sem escrita ou OID bloqueado); EWS/network_id.htm sem resposta — verifique credenciais e HTTPS'
+        result['detail'] = 'SNMP SET falhou; EWS/network_id.htm: campos DNS não identificados ou POST rejeitado — verifique credenciais, HTTPS e versão de firmware'
 
     elif manufacturer == 'Samsung':
         import json as _json, urllib.parse
