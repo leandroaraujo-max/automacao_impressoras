@@ -424,10 +424,12 @@ Permite configurar DNS primário e secundário em impressoras HP e Samsung diret
 
 | Fabricante | Método de aplicação |
 |-----------|-------------------|
-| HP | SNMP SET via JetDirect MIB → EWS JSON API → SyncThru (fallback em cascata) |
-| Samsung | SyncThru Web Service HTTP POST |
-| Zebra | HTTP POST em `/server/NWSET.htm` (via credenciais) |
+| HP | SNMP SET JetDirect → `network_id.htm` GET-parse-POST-verify (CookieJar + Referer + CSRFToken) → EWS SetStaticDNS → SyncThru |
+| Samsung | SyncThru `/sws/` via sessão autenticada por cookie |
+| Zebra | HTTP GET-parse-POST `/server/NWSET.htm` (CookieJar + Basic Auth) |
 | Honeywell | Não suportado (manual) |
+
+> **Porta 9100 bloqueada:** Os firewalls dos CDs bloqueiam 100% do tráfego TCP 9100. Todo acesso à Zebra usa exclusivamente HTTP (porta 80) e SNMP (UDP 161).
 
 ---
 
@@ -716,7 +718,7 @@ Constantes **fixas no código** (não configuráveis por `.env`):
 | Função | Descrição |
 |--------|-----------|
 | `get_page_count(ip)` | XML HP EWS → SNMP OID padrão |
-| `get_zebra_odometer(ip)` | HTTP SYSINFO → SNMP Eltron (pol.) → SNMP ZebraNet (dots ÷ DPI) |
+| `get_zebra_odometer(ip)` | SNMP Eltron (pol.) → SNMP ZebraNet (dots ÷ DPI) → HTTP `/server/SYSINFO.htm` → HTTP `/server/CFGPAGE.htm`; **sem porta 9100** |
 | `get_hp_consumables(ip)` | XML ConsumableConfigDyn → HTML EWS → SNMP |
 | `get_samsung_consumables(ip)` | HTML SyncThru → SNMP |
 | `get_network_config(ip, mfr)` | Coleta DNS/hostname/gateway/ip_mode via SNMP e HTTP com auth tracking |
@@ -733,8 +735,14 @@ Constantes **fixas no código** (não configuráveis por `.env`):
 
 | Função | Descrição |
 |--------|-----------|
-| `apply_dns_config(ip, mfr, dns1, dns2)` | Aplica DNS em cascata (SNMP SET → EWS → `network_id.htm` → SyncThru) |
-| `_samsung_syncthru_set_dns(ip, user, pw, dns1, dns2)` | Auth por sessão/cookie no SyncThru Samsung + aplica DNS |
+| `apply_dns_config(ip, mfr, dns1, dns2)` | Delega ao `VENDOR_ADAPTERS` registry (padrão Strategy) |
+| `_HPAdapter.apply_dns` | SNMP SET → `_hp_network_id_apply_dns` → EWS SetStaticDNS → SyncThru |
+| `_SamsungAdapter.apply_dns` | `_samsung_syncthru_set_dns` com sessão por cookie |
+| `_ZebraAdapter.apply_dns` | HTTP GET-parse-POST `/server/NWSET.htm` (CookieJar + Basic Auth) |
+| `_GenericAdapter.apply_dns` | Retorna `ok=False` sem I/O (Honeywell por enquanto) |
+| `_hp_network_id_apply_dns(ip, dns1, dns2, user, pw)` | GET → extrai `<form action>` → parse campos (checkbox/radio/submit correto) → POST + re-GET verify |
+| `_samsung_syncthru_set_dns(ip, user, pw, dns1, dns2)` | Login por sessão/cookie no SyncThru + PUT/POST DNS |
+| `_zebra_sgd(ip, command)` | **Stub inativo** — porta 9100 bloqueada; retorna `None` sem I/O |
 | `_snmp_set_string(ip, oid, value)` | SNMP SET com validação correta do `error-status` no SetResponse |
 | `load_printer_credentials()` | Lê `printer_credentials.json` |
 | `save_printer_credentials(creds)` | Salva `printer_credentials.json` |
@@ -747,6 +755,40 @@ Constantes **fixas no código** (não configuráveis por `.env`):
 |--------|----------|
 | `_with_retry(fn, attempts, base_delay)` | Executa `fn()` até 3 vezes com backoff exponencial (1s→2s→4s ±20% jitter); erros HTTP 4xx não são retriados |
 | `_setup_file_logging()` | Adiciona `RotatingFileHandler` ao logger raiz → `automacao.log` (5 MB, 3 backups) |
+
+### Arquitetura Strategy/Adapter (VendorAdapter)
+
+A lógica de comunicação por fabricante está isolada em adaptadores registrados no dicionário `VENDOR_ADAPTERS`:
+
+```python
+VENDOR_ADAPTERS: dict = {
+    'HP':        _HPAdapter(),
+    'Samsung':   _SamsungAdapter(),
+    'Zebra':     _ZebraAdapter(),
+    'Honeywell': _GenericAdapter('Honeywell'),
+}
+```
+
+`apply_dns_config` simplesmente delega:
+```python
+def apply_dns_config(ip, manufacturer, dns1, dns2):
+    adapter = VENDOR_ADAPTERS.get(manufacturer, _DEFAULT_ADAPTER)
+    return adapter.apply_dns(ip, dns1, dns2)
+```
+
+Para adicionar suporte a um novo fabricante: implemente `_NovoAdapter(VendorAdapter)` e registre-o em `VENDOR_ADAPTERS`.
+
+### Background Scheduler
+
+Ao iniciar o processo, uma thread daemon `bg-scheduler` é lançada automaticamente. Ela executa `run_full_scan(update_only=True)` a cada 60 minutos, mantendo o inventário atualizado sem necessidade de intervenção manual:
+
+```
+[scheduler] Iniciado. Intervalo: 60 min.
+[scheduler] Iniciando atualizacao de metricas (update_only=True)...
+[scheduler] Atualizacao concluida.
+```
+
+O intervalo é controlado pela constante `_SCHEDULER_INTERVAL_S = 3600` em `main()`.
 
 ### Diagnóstico (probe)
 
@@ -763,6 +805,18 @@ Constantes **fixas no código** (não configuráveis por `.env`):
 O Flask escuta em `0.0.0.0:8080` para aceitar conexões de qualquer IP. A regra de firewall abaixo é **obrigatória** para acesso de outras máquinas na rede (ex.: rede Magalu a partir de outro PC).
 
 > **Estado atual:** A regra já foi criada na máquina de produção (`Scanner Impressoras — Flask 8080`, porta TCP 8080, Profile Any, Enabled: True).
+
+### Portas necessárias para o scanner se comunicar com as impressoras
+
+| Porta | Protocolo | Status nos CDs | Uso |
+|-------|-----------|----------------|-----|
+| **80** | TCP (HTTP) | ✅ Aberta | EWS (HP), SyncThru (Samsung), ZebraNet (Zebra) — **principal** |
+| **443** | TCP (HTTPS) | ✅ Aberta | Interface web com SSL auto-assinado (principalmente HP) |
+| **631** | TCP (IPP) | ✅ Aberta | Scan de descoberta nmap |
+| **161** | UDP (SNMP) | ✅ Aberta | Serial, contador de páginas, toner, DNS (HP SNMP SET) |
+| **9100** | TCP (RAW/JetDirect/SGD) | ❌ **Bloqueada** | Impressão RAW / comandos SGD Zebra — **não usar** |
+
+> **Porta 9100 bloqueada:** Confirmado por auditoria em todos os CDs. O helper `_zebra_sgd` é um stub inativo. Toda comunicação com Zebra usa porta 80 (HTTP) e 161 (SNMP).
 
 ### Criar ou recriar a regra
 
@@ -826,3 +880,42 @@ git add scan_printers.py config.py .env.example .gitignore Templates/inventory_t
 git commit -m "mensagem"
 git push origin main
 ```
+
+---
+
+## 📝 Changelog
+
+### Sprint 12/05/2026 — Resiliência, Refatoração e Automação
+
+#### `ea12aac` — feat: ZebraAdapter 100% HTTP/SNMP + background scheduler
+- **`_ZebraAdapter.apply_dns`**: removida tentativa SGD (porta 9100 bloqueada nos CDs). Método usa exclusivamente HTTP GET-parse-POST `/server/NWSET.htm` com `CookieJar` + Basic Auth (mesmo padrão do `_hp_network_id_apply_dns`).
+- **`get_zebra_odometer`**: cascata agora é SNMP Eltron → SNMP ZebraNet → HTTP `/server/SYSINFO.htm` → HTTP `/server/CFGPAGE.htm`. SGD removido.
+- **`_zebra_sgd`**: convertida em **stub inativo** — retorna `None` sem abrir socket. Mantida para compatibilidade de assinatura.
+- **Background scheduler**: thread daemon `bg-scheduler` lançada em `main()` com `time.sleep(3600)`. Executa `run_full_scan(update_only=True)` a cada 60 minutos. Exceções capturadas com `log.warning` — nunca derruba o servidor.
+
+#### `1640e3d` — fix: timeouts fail-fast + cascata SNMP→SGD→HTTP no odômetro Zebra
+- Todos os `HTTP_TIMEOUT+3` (6 s) substituídos por `HTTP_TIMEOUT` (3 s) em `_hp_network_id_apply_dns` e `_ZebraAdapter.apply_dns` (6 ocorrências).
+- `_zebra_sgd`: timeout reduzido de 4 s para 3 s.
+- `get_zebra_odometer`: cascata reordenada para SNMP (UDP, não sujeito a firewall) → SGD → HTTP.
+
+#### `ae3d4c9` — refactor: Strategy pattern para DNS por fabricante (VendorAdapter)
+- **`VendorAdapter`** (ABC) + `_HPAdapter`, `_SamsungAdapter`, `_ZebraAdapter`, `_GenericAdapter`.
+- **`VENDOR_ADAPTERS`** registry: `{'HP': ..., 'Samsung': ..., 'Zebra': ..., 'Honeywell': ...}`.
+- **`apply_dns_config`**: simplificada para 6 linhas — delega ao registry.
+- **`_apply_worker`**: guard `if mfr not in ('HP', 'Samsung')` → `if mfr not in VENDOR_ADAPTERS`. Zebra/Honeywell passam pelo adaptador correto.
+- **`api_dns_report`**: mesmo guard atualizado.
+- **`_zebra_sgd`**: helper TCP 9100 criado (posteriormente desativado).
+- **`get_zebra_odometer`**: SGD adicionado como tentativa 0 (posteriormente reordenado/removido).
+
+#### `644c37d` — fix: HP EWS DNS apply — falso positivo em `network_id.htm`
+- **Causa raiz**: 4 bugs simultâneos: endpoint errado (`/network_id.htm` vs. `/network_id.htm/config`), checkboxes não marcados incluídos no payload (causavam HTTP 400), ausência de sessão/cookie (CSRFToken inválido), validação falsa (`len(resp) > 50` sempre verdadeiro).
+- **`_hp_network_id_apply_dns`** reescrita com: `CookieJar` para manter `sessionId`, extração dinâmica de `<form action>`, tratamento correto de `checkbox`/`radio`/`submit`, cabeçalho `Referer` obrigatório, verificação real pós-POST via re-GET.
+- **`_HP_DNS1_FIELD_NAMES`/`_HP_DNS2_FIELD_NAMES`**: adicionados campos confirmados em produção (`IPv4_DnsServerId`, `IPv4_Sec_DnsServerId`).
+- **Testado em produção**: HP LaserJet E60165 (`10.70.82.27`) — DNS alterado e verificado.
+
+#### `5404576` — fix: `_with_retry` + `_apply_worker` + UI spinner
+- **`_with_retry`**: envolve `fn()` em `try/except Exception` — `HTTPError 503` (Samsung SyncThru indisponível) não propaga mais; retorna `None` e retenta com backoff.
+- **`_apply_worker`**: adicionado `try/except Exception` em torno de `apply_dns_config`.
+- **`_snmp_set_string`**: validação correta do `error-status` SNMP (antes aceitava qualquer resposta SNMP incluindo `readOnly`/`noSuchName` como sucesso).
+- **UI spinner**: `applyDnsAction()` em `inventory_template.html` — botão desabilitado + animação CSS `@keyframes dns-spin` durante operação; `.finally()` garante re-habilitação.
+
