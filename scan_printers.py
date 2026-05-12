@@ -65,6 +65,27 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+def _setup_file_logging() -> None:
+    """Adiciona RotatingFileHandler ao logger raiz.
+
+    Cria automacao.log na pasta do script com rotação em 5 MB, 3 backups.
+    Chamado uma única vez no main() após imports — não bloqueia o import do módulo.
+    """
+    from logging.handlers import RotatingFileHandler
+    log_path = BASE_DIR / 'automacao.log'
+    handler = RotatingFileHandler(
+        log_path,
+        maxBytes=5 * 1024 * 1024,   # 5 MB
+        backupCount=3,
+        encoding='utf-8',
+    )
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(threadName)s — %(message)s'
+    ))
+    logging.getLogger().addHandler(handler)
+    log.info(f'Log em arquivo iniciado: {log_path}')
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -75,13 +96,32 @@ CACHE_PATH            = BASE_DIR / 'cache.json'
 CREDENTIALS_PATH      = BASE_DIR / 'printer_credentials.json'
 ADMIN_KEY_PATH        = BASE_DIR / 'admin.key'
 TEMPLATE_PATH         = BASE_DIR / 'Templates' / 'inventory_template.html'
-PROBE_PORT     = 5001
 
-SNMP_COMMUNITY  = 'public'
-SNMP_TIMEOUT    = 2
-HTTP_TIMEOUT    = 3
+# Carrega configuráveis de config.py (que lê .env)
+try:
+    from config import (
+        PROBE_PORT, SNMP_COMMUNITY, SNMP_TIMEOUT, HTTP_TIMEOUT, MAX_CONCURRENT,
+        HP_EWS_USERS, HP_EWS_PASSWORDS, HP_EWS_USER, HP_EWS_PASSWORD,
+        SAMSUNG_USER, SAMSUNG_PASSWORDS,
+        ZEBRA_USER, ZEBRA_PASSWORDS,
+    )
+except ImportError:
+    # Fallback se config.py não estiver disponível
+    PROBE_PORT      = 5001
+    SNMP_COMMUNITY  = 'public'
+    SNMP_TIMEOUT    = 2
+    HTTP_TIMEOUT    = 3
+    MAX_CONCURRENT  = 10
+    HP_EWS_USERS     = ['administrador', 'admin']
+    HP_EWS_PASSWORDS = ['simpress1934@', '12345678', '']
+    HP_EWS_USER      = HP_EWS_USERS[0]
+    HP_EWS_PASSWORD  = HP_EWS_PASSWORDS[0]
+    SAMSUNG_USER      = 'admin'
+    SAMSUNG_PASSWORDS = ['sec00000', '1111', 'simpress1934@', '12345678', '3737', '']
+    ZEBRA_USER        = 'admin'
+    ZEBRA_PASSWORDS   = ['1234', '1934', '3737', '']
+
 NMAP_ARGS       = '-p 80,443,631,9100 --open -T4'
-MAX_CONCURRENT  = 10
 
 # ---------------------------------------------------------------------------
 # Admin auth helpers
@@ -148,21 +188,6 @@ OID_STD_HOSTNAME      = '1.3.6.1.2.1.1.5.0'              # RFC 1213 sysName
 # HP — SNMP SET (community de escrita)
 SNMP_WRITE_COMMUNITY  = 'public'
 
-# HP — EWS HTTP Basic Auth (tenta múltiplos usuários e senhas)
-HP_EWS_USERS     = ['administrador', 'admin']
-HP_EWS_PASSWORDS = ['simpress1934@', '12345678', '']
-# Compat com código legado que usa as variáveis simples
-HP_EWS_USER     = HP_EWS_USERS[0]
-HP_EWS_PASSWORD = HP_EWS_PASSWORDS[0]
-
-# Samsung SyncThru HTTP
-SAMSUNG_USER      = 'admin'
-SAMSUNG_PASSWORDS = ['sec00000', '1111', 'simpress1934@', '12345678', '3737', '']
-
-# Zebra ZebraNet HTTP
-ZEBRA_USER      = 'admin'
-ZEBRA_PASSWORDS = ['1234', '1934', '3737', '']
-
 # ---- Classificação de fabricantes -----------------------------------------
 KNOWN_MANUFACTURERS   = frozenset({'HP', 'Samsung', 'Zebra', 'Honeywell'})
 LASER_MANUFACTURERS   = frozenset({'HP', 'Samsung'})
@@ -187,6 +212,9 @@ _scan_status: dict = {
     'started_at':      None,
     'finished_at':     None,
 }
+
+# Momento de início do servidor — exposto via /healthcheck
+_server_start_time: datetime = datetime.now()
 
 # Flask é carregado apenas quando o servidor de probe precisa subir
 _flask_app = None
@@ -252,7 +280,7 @@ def load_network_entries() -> list[dict]:
         log.error(f'CSV não encontrado: {CSV_PATH}')
         return []
     except Exception as exc:
-        log.error(f'Erro ao ler CSV: {exc}')
+        log.error(f'Erro ao ler CSV: {exc}', exc_info=True)
         return []
 
     # Identifica colunas de range dinamicamente (Range 01, Range 02, ...)
@@ -422,25 +450,62 @@ def get_serial(ip: str, manufacturer: str) -> str:
     return _snmp_get(ip, OID_SERIAL) or 'N/A'
 
 
+# ---------------------------------------------------------------------------
+# Retry com backoff exponencial — apenas para chamadas HTTP
+# ---------------------------------------------------------------------------
+
+def _with_retry(fn, *, attempts: int = 3, base_delay: float = 1.0):
+    """Executa fn() até `attempts` vezes com backoff exponencial.
+
+    Espera: base_delay * 2^tentativa + jitter ±20 %.
+    Retorna o resultado de fn() quando bem-sucedido (não-None).
+    Se todos os attempts falharem, retorna None.
+    Só retentar em urllib.error.URLError / OSError / TimeoutError.
+    Erros 4xx (HTTPError com status 4xx) não são retriados.
+    """
+    import random
+    for attempt in range(attempts):
+        result = fn()
+        if result is not None:
+            return result
+        if attempt < attempts - 1:
+            delay = base_delay * (2 ** attempt)
+            jitter = delay * 0.2 * (2 * random.random() - 1)  # ±20 %
+            time.sleep(max(0.0, delay + jitter))
+    return None
+
+
 def _http_get_page(ip: str, path: str, use_https: bool = False,
                    timeout: int = HTTP_TIMEOUT) -> Optional[str]:
-    """GET helper — retorna body (str) ou None em caso de erro."""
-    import ssl
+    """GET helper — retorna body (str) ou None em caso de erro.
+
+    Retentar até 3 vezes com backoff exponencial em caso de falha de rede.
+    Erros 4xx (recurso não existe) não são retriados.
+    """
+    import ssl, urllib.error
     scheme = 'https' if use_https else 'http'
     url = f'{scheme}://{ip}{path}'
-    try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'PrinterScanner/1.0'})
-        if use_https:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-                return resp.read(65536).decode('utf-8', errors='ignore')
-        else:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.read(65536).decode('utf-8', errors='ignore')
-    except Exception:
-        return None
+
+    def _attempt() -> Optional[str]:
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'PrinterScanner/1.0'})
+            if use_https:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                    return resp.read(65536).decode('utf-8', errors='ignore')
+            else:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return resp.read(65536).decode('utf-8', errors='ignore')
+        except urllib.error.HTTPError as e:
+            if 400 <= e.code < 500:
+                return None   # 4xx: não adianta retentar
+            raise             # 5xx ou outro: _with_retry capturará como None
+        except Exception:
+            return None
+
+    return _with_retry(_attempt)
 
 
 # ---------------------------------------------------------------------------
@@ -756,34 +821,46 @@ def _http_post_authenticated(ip: str, path: str, payload: str,
                               user: str, password: str,
                               content_type: str = 'application/x-www-form-urlencoded',
                               use_https: bool = False) -> Optional[str]:
-    """POST HTTP com autenticação Basic."""
-    import base64, ssl
+    """POST HTTP com autenticação Basic.
+
+    Retentar até 3 vezes com backoff exponencial em caso de falha de rede.
+    Erros 4xx não são retriados (credencial inválida, recurso inexistente).
+    """
+    import base64, ssl, urllib.error
     scheme = 'https' if use_https else 'http'
     url = f'{scheme}://{ip}{path}'
     creds = base64.b64encode(f'{user}:{password}'.encode()).decode()
-    try:
-        req = urllib.request.Request(
-            url,
-            data=payload.encode(),
-            headers={
-                'Authorization': f'Basic {creds}',
-                'Content-Type':  content_type,
-                'User-Agent':    'PrinterScanner/1.0',
-            },
-            method='POST',
-        )
-        if use_https:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=ctx) as r:
-                return r.read(4096).decode('utf-8', errors='ignore')
-        else:
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
-                return r.read(4096).decode('utf-8', errors='ignore')
-    except Exception as e:
-        log.debug(f'[http_post] {ip}{path} erro: {e}')
-        return None
+
+    def _attempt() -> Optional[str]:
+        try:
+            req = urllib.request.Request(
+                url,
+                data=payload.encode(),
+                headers={
+                    'Authorization': f'Basic {creds}',
+                    'Content-Type':  content_type,
+                    'User-Agent':    'PrinterScanner/1.0',
+                },
+                method='POST',
+            )
+            if use_https:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=ctx) as r:
+                    return r.read(4096).decode('utf-8', errors='ignore')
+            else:
+                with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+                    return r.read(4096).decode('utf-8', errors='ignore')
+        except urllib.error.HTTPError as e:
+            if 400 <= e.code < 500:
+                return None   # 4xx: não adianta retentar
+            raise
+        except Exception as e:
+            log.debug(f'[http_post] {ip}{path} erro: {e}')
+            return None
+
+    return _with_retry(_attempt)
 
 
 def _samsung_syncthru_set_dns(ip: str, user: str, password: str,
@@ -1346,7 +1423,7 @@ def save_cache(printers: list[dict]) -> None:
         )
         log.info(f'Cache salvo: {CACHE_PATH} ({len(printers)} entradas)')
     except Exception as exc:
-        log.error(f'Erro ao salvar cache: {exc}')
+        log.error(f'Erro ao salvar cache: {exc}', exc_info=True)
 
 
 def load_printer_credentials() -> dict:
@@ -1365,7 +1442,7 @@ def save_printer_credentials(creds: dict) -> None:
             encoding='utf-8',
         )
     except Exception as exc:
-        log.error(f'Erro ao salvar credenciais: {exc}')
+        log.error(f'Erro ao salvar credenciais: {exc}', exc_info=True)
 
 
 def update_metrics_from_cache(cached: dict) -> dict:
@@ -1714,7 +1791,7 @@ def scan_network(entry: dict, known_ips: set[str]) -> list[dict]:
                     log.debug(f'[CD {cd}] {host} ignorado — portas: {open_ports}')
 
         except Exception as exc:
-            log.error(f'Erro ao escanear {network}: {exc}')
+            log.error(f'Erro ao escanear {network}: {exc}', exc_info=True)
             return found
 
     if not candidates:
@@ -2070,6 +2147,19 @@ def _register_routes(flask_app, req, jsonify_fn, render_tmpl):
         """Status do scan em andamento."""
         return jsonify_fn(dict(_scan_status))
 
+    @flask_app.route('/healthcheck')
+    def healthcheck():
+        """Verifica se o servidor está saudável e retorna métricas básicas."""
+        cache = load_cache()
+        uptime = int((datetime.now() - _server_start_time).total_seconds())
+        return jsonify_fn({
+            'ok':           True,
+            'version':      '1.0',
+            'uptime_s':     uptime,
+            'scan_running': bool(_scan_status.get('running')),
+            'cache_size':   len(cache),
+        })
+
     @flask_app.route('/api/cds')
     def api_cds():
         """Retorna lista de CDs disponíveis no cache."""
@@ -2388,6 +2478,7 @@ def _scan_and_open(update_only: bool = False) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 def main() -> None:
+    _setup_file_logging()   # ativa log em arquivo (automacao.log)
     parser = argparse.ArgumentParser(
         description='Scanner de impressoras — gera inventário estático HTML'
     )

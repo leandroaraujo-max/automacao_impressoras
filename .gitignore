@@ -7,3 +7,10 @@ __pycache__/
 # Outros arquivos que você não quer subir
 *.txt
 *.bat
+
+# Configuração local com senhas e parâmetros reais (não versionar)
+.env
+
+# Log gerado em runtime
+automacao.log
+automacao.log.*
