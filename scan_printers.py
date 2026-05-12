@@ -1081,7 +1081,7 @@ class _ZebraAdapter(VendorAdapter):
                 try:
                     req = urllib.request.Request(
                         f'{scheme}://{ip}/server/NWSET.htm', headers=hdrs)
-                    with opener.open(req, timeout=HTTP_TIMEOUT + 3) as r:
+                    with opener.open(req, timeout=HTTP_TIMEOUT) as r:
                         html = r.read(32768).decode('utf-8', 'ignore')
                 except Exception as e:
                     log.debug(f'[zebra_dns] {ip} GET /server/NWSET.htm falhou '
@@ -1163,7 +1163,7 @@ class _ZebraAdapter(VendorAdapter):
                     method='POST',
                 )
                 try:
-                    with opener.open(req2, timeout=HTTP_TIMEOUT + 3) as r:
+                    with opener.open(req2, timeout=HTTP_TIMEOUT) as r:
                         _ = r.read(4096)
                 except Exception as e:
                     log.debug(f'[zebra_dns] {ip} POST {post_path} falhou: {e}')
@@ -1173,7 +1173,7 @@ class _ZebraAdapter(VendorAdapter):
                 try:
                     req3 = urllib.request.Request(
                         f'{scheme}://{ip}/server/NWSET.htm', headers=hdrs)
-                    with opener.open(req3, timeout=HTTP_TIMEOUT + 3) as r:
+                    with opener.open(req3, timeout=HTTP_TIMEOUT) as r:
                         verify = r.read(32768).decode('utf-8', 'ignore')
                     if verify and dns1 in verify:
                         log.info(f'[apply_dns] {ip} Zebra HTTP NWSET.htm ok: {dns1}/{dns2}')
@@ -1294,7 +1294,7 @@ def _hp_network_id_apply_dns(ip: str, dns1: str, dns2: str,
     # 1. GET — obtém o HTML do formulário e o cookie de sessão
     try:
         req = urllib.request.Request(f'{scheme}://{ip}/network_id.htm', headers=hdrs)
-        with opener.open(req, timeout=HTTP_TIMEOUT + 3) as r:
+        with opener.open(req, timeout=HTTP_TIMEOUT) as r:
             html = r.read(65536).decode('utf-8', 'ignore')
     except Exception as e:
         log.debug(f'[hp_net_id] {ip} GET falhou (use_https={use_https}): {e}')
@@ -1381,7 +1381,7 @@ def _hp_network_id_apply_dns(ip: str, dns1: str, dns2: str,
         method='POST',
     )
     try:
-        with opener.open(req2, timeout=HTTP_TIMEOUT + 3) as r:
+        with opener.open(req2, timeout=HTTP_TIMEOUT) as r:
             _ = r.read(4096)  # lê body para liberar conexão
     except Exception as e:
         log.debug(f'[hp_net_id] {ip} POST {post_path} falhou: {e}')
@@ -1390,7 +1390,7 @@ def _hp_network_id_apply_dns(ip: str, dns1: str, dns2: str,
     # 6. Re-GET para verificar que os novos valores de DNS aparecem na página
     try:
         req3 = urllib.request.Request(f'{scheme}://{ip}/network_id.htm', headers=hdrs)
-        with opener.open(req3, timeout=HTTP_TIMEOUT + 3) as r:
+        with opener.open(req3, timeout=HTTP_TIMEOUT) as r:
             verify = r.read(65536).decode('utf-8', 'ignore')
         if verify and dns1 in verify:
             log.info(f'[hp_net_id] {ip} DNS verificado: {dns1}/{dns2} '
@@ -1428,15 +1428,32 @@ def get_page_count(ip: str) -> Optional[str]:
 def get_zebra_odometer(ip: str) -> Optional[str]:
     """Odômetro da cabeça térmica Zebra em polegadas.
 
-    0. SGD porta 9100 — odometer.total_print_length (ZT/ZD firmware moderno)
-    1. HTTP /server/SYSINFO.htm — Head Mileage (ZT/ZD series)
-    2. HTTP /server/CFGPAGE.htm — Config page
-    3. SNMP OID Eltron (polegadas, modelos GK/LP/legado)
-    4. SNMP OID ZebraNet dot count ÷ DPI
+    Cascata Fail-Fast (ordem de velocidade/resiliência a firewall):
+    1. SNMP UDP 161 — OID Eltron (polegadas, modelos GK/LP/legado). UDP não é
+       bloqueado por firewalls de porta normalmente e responde em <2 s.
+    2. SNMP UDP 161 — OID ZebraNet dot count ÷ DPI (firmwares ZT/ZD SNMP).
+    3. SGD TCP 9100 — odometer.total_print_length (ZT/ZD firmware moderno).
+       Bloqueado em alguns ambientes; timeout 3 s, silencia exceções.
+    4. HTTP TCP 80  — /server/SYSINFO.htm  (regex Head Mileage/Odometer).
+    5. HTTP TCP 80  — /server/CFGPAGE.htm  (mesmo regex).
     """
     import re
 
-    # --- Tentativa 0: SGD nativo (firmware ZT/ZD/ZC moderno) ---
+    # --- 1. SNMP Eltron (UDP — mais rápido, menor risco de firewall) ---
+    val = _snmp_get(ip, OID_ZEBRA_ODOM_ELTRON)
+    if val and val.lstrip('-').isdigit():
+        inches = int(val)
+        if 0 < inches < 5_000_000:
+            return f'{inches:,} pol.'
+
+    # --- 2. SNMP ZebraNet dots ÷ DPI ---
+    val = _snmp_get(ip, OID_ZEBRA_ODOM_DOTS)
+    if val and val.lstrip('-').isdigit():
+        dots = int(val)
+        if dots > 0:
+            return f'{dots // ZEBRA_DEFAULT_DPI:,} pol.'
+
+    # --- 3. SGD nativo TCP 9100 (timeout 3 s; silencia firewall-drop) ---
     sgd_raw = _zebra_sgd(ip, '! U1 getvar "odometer.total_print_length"')
     if sgd_raw:
         sgd_clean = sgd_raw.strip().lstrip('"').rstrip('"').replace(',', '')
@@ -1444,18 +1461,15 @@ def get_zebra_odometer(ip: str) -> Optional[str]:
             val_int = int(sgd_clean)
             if val_int > 0:
                 # Heurística: valor > 50 000 → provável dots; caso contrário polegadas
-                if val_int > 50_000:
-                    inches = val_int // ZEBRA_DEFAULT_DPI
-                else:
-                    inches = val_int
+                inches = val_int // ZEBRA_DEFAULT_DPI if val_int > 50_000 else val_int
                 if 0 < inches < 5_000_000:
                     return f'{inches:,} pol.'
 
+    # --- 4-5. HTTP scraping TCP 80 (fallback final) ---
     for path in ('/server/SYSINFO.htm', '/server/CFGPAGE.htm'):
         body = _http_get_page(ip, path)
         if not body:
             continue
-        # Ex: "Head Mileage: 1,234 in" ou "Head Odometer: 1234in"
         m = re.search(
             r'Head\s+(?:Mileage|Odometer)\s*[:\-=]?\s*([\d,]+)\s*in',
             body, re.I)
@@ -1463,7 +1477,6 @@ def get_zebra_odometer(ip: str) -> Optional[str]:
             inches = int(m.group(1).replace(',', ''))
             if 0 < inches < 5_000_000:
                 return f'{inches:,} pol.'
-        # Às vezes reporta em dots
         m = re.search(
             r'Head\s+(?:Mileage|Odometer)\s*[:\-=]?\s*([\d,]+)\s*dot',
             body, re.I)
@@ -1472,23 +1485,10 @@ def get_zebra_odometer(ip: str) -> Optional[str]:
             if dots > 0:
                 return f'{dots // ZEBRA_DEFAULT_DPI:,} pol.'
 
-    # SNMP fallback
-    val = _snmp_get(ip, OID_ZEBRA_ODOM_ELTRON)
-    if val and val.lstrip('-').isdigit():
-        inches = int(val)
-        if 0 < inches < 5_000_000:
-            return f'{inches:,} pol.'
-
-    val = _snmp_get(ip, OID_ZEBRA_ODOM_DOTS)
-    if val and val.lstrip('-').isdigit():
-        dots = int(val)
-        if dots > 0:
-            return f'{dots // ZEBRA_DEFAULT_DPI:,} pol.'
-
     return None
 
 
-def _zebra_sgd(ip: str, command: str, timeout: float = 4.0) -> Optional[str]:
+def _zebra_sgd(ip: str, command: str, timeout: float = 3.0) -> Optional[str]:
     """Envia um comando SGD para a Zebra via socket TCP porta 9100.
 
     Comandos típicos:
