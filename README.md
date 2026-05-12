@@ -9,15 +9,16 @@ Kit de automação para inventário e diagnóstico de impressoras distribuídas 
 1. [Requisitos do Sistema](#-requisitos-do-sistema)
 2. [Estrutura do Projeto](#-estrutura-do-projeto)
 3. [Uso Rápido](#-uso-rápido)
-4. [Funcionalidades](#-funcionalidades)
-5. [Fluxo de Execução](#-fluxo-de-execução)
-6. [API Flask — Referência de Rotas](#-api-flask--referência-de-rotas)
-7. [Modelo de Dados](#-modelo-de-dados--printerinfo)
-8. [Referência de OIDs SNMP](#-referência-de-oids-snmp)
-9. [CSV de Endereçamento](#-csv-de-endereçamento)
-10. [Constantes Configuráveis](#-constantes-configuráveis)
-11. [Referência de Funções](#-referência-de-funções)
-12. [Acesso de Rede e Firewall](#-acesso-de-rede-e-firewall)
+4. [Controle de Acesso](#-controle-de-acesso)
+5. [Funcionalidades](#-funcionalidades)
+6. [Fluxo de Execução](#-fluxo-de-execução)
+7. [API Flask — Referência de Rotas](#-api-flask--referência-de-rotas)
+8. [Modelo de Dados](#-modelo-de-dados--printerinfo)
+9. [Referência de OIDs SNMP](#-referência-de-oids-snmp)
+10. [CSV de Endereçamento](#-csv-de-endereçamento)
+11. [Constantes Configuráveis](#-constantes-configuráveis)
+12. [Referência de Funções](#-referência-de-funções)
+13. [Acesso de Rede e Firewall](#-acesso-de-rede-e-firewall)
 
 ---
 
@@ -116,7 +117,7 @@ C:\Users\_araujo\AppData\Local\Python\pythoncore-3.14-64\python.exe -m pip insta
 
 | Pacote | Versão testada | Obrigatório | Uso no projeto |
 |--------|---------------|-------------|----------------|
-| `flask` | 3.1.3 | **Sim** | Servidor web HTTP na porta 5001; rotas da API REST; serviço do painel `/results` e `/probe` |
+| `flask` | 3.1.3 | **Sim** | Servidor web HTTP na porta 5001; rotas `/home`, `/admin`, `/login`, `/probe` e API REST |
 | `pandas` | 3.0.2 | **Sim** | Leitura e parsing do CSV de endereçamento de redes por CD |
 | `python-nmap` | 0.7.1 | **Sim** | Wrapper Python do executável `nmap`; realiza scan de portas 80/443/631/9100 em cada rede CIDR |
 | `pysnmp` | 7.1.26 | Recomendado | SNMP GET de alto nível via `pysnmp.hlapi`; o script possui fallback BER puro-Python se não instalado |
@@ -179,13 +180,13 @@ Antes de executar o scanner pela primeira vez, confirme que os seguintes arquivo
 | `scan_printers.py` | **Sim** | Script principal |
 | `Redes Imps CDS/Endereçamento_Atualizado.csv` | **Sim** | CSV com redes CIDR por CD |
 | `Templates/inventory_template.html` | **Sim** | Template do inventário estático |
-| `Templates/results.html` | **Sim** | Dashboard de scan ao vivo |
 | `Templates/probe.html` | **Sim** | Página de diagnóstico individual |
+| `admin.key` | Não (gerado automaticamente) | Senha do painel admin (texto simples) |
 | `cache.json` | Não (gerado automaticamente) | Cache incremental de impressoras |
-| `inventory.html` | Não (gerado automaticamente) | Inventário estático gerado |
+| `inventory.html` | Não (gerado automaticamente) | Inventário HTML gerado |
 | `printer_credentials.json` | Não (gerado automaticamente) | Credenciais manuais por IP |
 
-> **`cache.json`** é criado automaticamente no primeiro scan. **`printer_credentials.json`** é criado automaticamente ao salvar credenciais pelo modal da interface.
+> **`admin.key`** é criado automaticamente na primeira execução com a senha padrão `admin`. **Troque o conteúdo do arquivo para uma senha segura antes de disponibilizar o servidor em rede.**
 
 ---
 
@@ -226,12 +227,12 @@ nmap -sU -p 161 10.70.82.10
 ```
 Impressoras/
 ├── scan_printers.py                     # Backend principal — scanner + API Flask
+├── admin.key                            # Senha do painel admin (texto simples; criado automaticamente)
 ├── cache.json                           # Cache incremental (gerado automaticamente)
-├── inventory.html                       # Inventário HTML estático (gerado automaticamente)
+├── inventory.html                       # Inventário HTML gerado (gerado automaticamente)
 ├── printer_credentials.json             # Credenciais manuais por IP (gerado automaticamente)
 ├── Templates/
-│   ├── inventory_template.html          # Template injetado com dados do scan → inventory.html
-│   ├── results.html                     # Dashboard de scan ao vivo
+│   ├── inventory_template.html          # Template com $DATA, $IS_ADMIN → inventory.html
 │   └── probe.html                       # Diagnóstico de conectividade individual
 └── Redes Imps CDS/
     ├── Atualizar-Redes.ps1              # Script PowerShell de atualização do CSV de endereçamento
@@ -257,46 +258,87 @@ python scan_printers.py --probe-only
 ```
 
 Após iniciar, acesse:
-- **Painel ao vivo:** `http://localhost:5001/results`
-- **Inventário estático:** abra o arquivo `inventory.html` diretamente no navegador
+- **Inventário público:** `http://localhost:5001/home` — visualização, filtros e exportação CSV
+- **Painel admin:** `http://localhost:5001/admin` — requer senha do `admin.key`
+- **Login:** `http://localhost:5001/login`
 - **Diagnóstico:** `http://localhost:5001/probe`
 
 > O servidor Flask fica disponível em `http://0.0.0.0:5001`. Para acesso de outras máquinas da rede, veja a seção [Acesso de Rede e Firewall](#-acesso-de-rede-e-firewall).
 
 ---
 
+## 🔐 Controle de Acesso
+
+O servidor possui dois perfis de acesso, separados por rota:
+
+| Rota | Perfil | O que pode fazer |
+|------|--------|------------------|
+| `/home` | **Público** | Visualizar inventário, aplicar filtros, exportar CSV |
+| `/admin` | **Admin** | Tudo do público + aplicar DNS, configurar credenciais das impressoras |
+| `/login` | — | Formulário de autenticação (senha armazenada em `admin.key`) |
+| `/logout` | — | Encerra sessão e redireciona para `/home` |
+
+### Configurar a senha de admin
+
+Na primeira execução, o arquivo `admin.key` é criado automaticamente com a senha padrão `admin`.
+
+**Altere a senha antes de disponibilizar em rede:**
+
+```powershell
+# Substitua 'MinhaS3nhaSegura' pela senha desejada
+Set-Content -Path "C:\Projetos\Impressoras\admin.key" -Value "MinhaS3nhaSegura" -Encoding UTF8 -NoNewline
+```
+
+> **Importante:** A senha é armazenada em texto simples. O arquivo deve ter permissões de leitura restritas ao usuário que executa o scanner. Em ambientes de produção, considere bloquear o arquivo via ACL do Windows.
+
+### Comportamento da sessão
+
+- A sessão é mantida por cookie do browser enquanto o servidor estiver rodando
+- **Ao reiniciar o `scan_printers.py`, todas as sessões expiram** — todos os admins precisarão fazer login novamente
+- Não há persistência de sessão entre reinicializações (intencional)
+
+### O que é bloqueado para usuários públicos
+
+| Elemento | Público | Admin |
+|----------|---------|-------|
+| Visualizar inventário / filtrar | ✅ | ✅ |
+| Exportar CSV | ✅ | ✅ |
+| Painel DNS (DNS Alvo + Aplicar) | ❌ oculto | ✅ visível |
+| Ícone 🔑 clicável (configurar credenciais) | ❌ sem ação | ✅ abre modal |
+| `POST /api/apply-dns` | ❌ 403 | ✅ |
+| `POST /api/set-credentials` | ❌ 403 | ✅ |
+
+---
+
 ## ✨ Funcionalidades
 
-### Inventário Estático (`inventory.html`)
+### Inventário — `/home` (público) e `/admin` (admin)
 
-Arquivo HTML auto-contido gerado pelo script. Pode ser aberto diretamente no navegador **sem** o Flask estar em execução — mas algumas funcionalidades dinâmicas (probe, aplicação de DNS, exportação CSV, modal de credenciais) requerem que o Flask esteja rodando em `localhost:5001`.
+Gerenciado pelo mesmo template (`inventory_template.html`), com a variável `IS_ADMIN` controlando o que é exibido. Pode ser acessado pelo servidor Flask ou como arquivo estático `inventory.html` offline (funcionalidades dinâmicas indisponíveis).
 
-**Recursos:**
+**Recursos comuns (público e admin):**
 
 | Funcionalidade | Descrição |
-|---------------|-----------|
+|----------------|-----------|
 | Sidebar de CDs | Lista lateral com contador de impressoras por CD; campo de busca para filtrar |
-| Filtros em tempo real | Busca por IP, fabricante, modelo, serial, hostname |
-| Cards de totalizadores | Total, Laser, Térmica, CDs |
-| Tabela de impressoras | Todas as colunas coletadas, com badges coloridos por fabricante e alertas de toner baixo |
-| **↓ Exportar CSV** | Botão na topbar — exporta impressoras do CD ativo (ou todos) via `/api/export-csv` |
+| Filtros em tempo real | Busca por IP, fabricante, modelo, serial, hostname, DNS Status |
+| Cards de totalizadores | Total, Laser, Térmica, CDs, DNS incorreto |
+| Tabela de impressoras | Colunas coletadas com badges coloridos por fabricante e alertas de toner baixo |
+| **↓ Exportar CSV** | Exporta impressoras do CD ativo (ou todos) via `/api/export-csv` |
 | **🔑 Ícone de auth** | Ícone por impressora: verde = login HTTP OK, vermelho = falha, cinza = não tentado |
-| **Modal de credenciais** | Clique no 🔑 para abrir formulário com IP/Fabricante + usuário/senha; "Salvar e Testar" aplica imediatamente |
-| Probe individual | Ícone 🔍 por IP abre diagnóstico completo em nova aba |
-| Aplicação de DNS em lote | Botão no topbar aplica DNS target a todas as impressoras do CD via `/api/apply-dns` |
-| Coluna DNS Apply Status | Resultado da última aplicação de DNS (`OK`, `FALHOU`, etc.) |
+| Colunas ordenáveis | Clique no cabeçalho para ordenar (IPs numericamente, datas, números) |
+| Header fixo | Cabeçalho fixo durante rolagem vertical; scrollbar horizontal visível no meio da página |
+| Badge de perfil | Exibe **Admin** (azul) ou **Público** (âmbar) no topbar |
+| Botão Admin / Sair | Link para `/admin` (público) ou `/logout` (admin) no topbar |
 
-### Painel ao Vivo (`/results`)
-
-Dashboard com polling em tempo real durante o scan.
+**Recursos exclusivos admin (`/admin`):**
 
 | Funcionalidade | Descrição |
-|---------------|-----------|
-| Progresso do scan | Barra de progresso com redes concluídas/total e impressoras encontradas |
-| Auto-refresh | Polling a cada 5 s durante scan; reload automático ao finalizar |
-| Botão Parar Scan | Interrompe a varredura via `POST /scan/stop` |
-| Resultados por CD | Grupos expansíveis por CD |
-| Exportar CSV | Botão para download do CSV com impressoras descobertas |
+|----------------|-----------|
+| **Modal de credenciais** | Clique no 🔑 para abrir formulário IP/Fabricante + usuário/senha; "Salvar e Testar" aplica imediatamente |
+| **Painel DNS Alvo** | Campo para definir DNS primário/secundário alvo e botão "⚡ Aplicar nos incorretos" |
+| Aplicação de DNS em lote | Aplica DNS target a todas as HP/Samsung incorretas do CD via `/api/apply-dns` |
+| Coluna DNS Apply Status | Resultado da última aplicação de DNS (`OK`, `FALHOU`, etc.) |
 
 ### Rastreamento de Autenticação HTTP
 
@@ -368,18 +410,30 @@ python scan_printers.py
 
 ## 🌐 API Flask — Referência de Rotas
 
-| Método | Rota | Descrição |
-|--------|------|-----------|
-| `GET` | `/results` | Regenera `inventory.html` a partir do cache e serve |
-| `GET` | `/probe` | Página HTML de diagnóstico individual |
-| `GET` | `/api/status` | JSON com status do scan (`running`, `total`, `networks_done`, `networks_total`, `started_at`, `finished_at`) |
-| `GET` | `/api/cds` | JSON com lista de CDs disponíveis no cache |
-| `GET` | `/api/cd/<cd>` | JSON com impressoras de um CD específico |
-| `GET` | `/api/probe?ip=<ip>` | JSON com resultado completo de diagnóstico (portas TCP, HTTP, 10 OIDs SNMP) |
-| `GET` | `/api/export-csv?cd=<cd>` | Download CSV das impressoras (parâmetro `cd` opcional; sem ele exporta tudo) |
-| `POST` | `/api/set-credentials` | Salva credenciais de uma impressora e retesta conexão imediatamente |
-| `POST` | `/api/apply-dns` | Aplica DNS em lote em um CD ou em IPs específicos |
-| `POST` | `/scan/stop` | Interrompe o scan em andamento |
+### Páginas
+
+| Método | Rota | Perfil | Descrição |
+|--------|------|--------|-----------|
+| `GET` | `/home` | Público | Inventário somente leitura — filtros e exportação CSV |
+| `GET` | `/admin` | **Admin** | Inventário completo — aplica DNS, configura credenciais |
+| `GET/POST` | `/login` | — | Formulário de autenticação com senha do `admin.key` |
+| `GET` | `/logout` | — | Encerra sessão e redireciona para `/home` |
+| `GET` | `/results` | — | Redirect para `/home` (compatibilidade com URLs antigas) |
+| `GET` | `/probe` | Público | Página HTML de diagnóstico individual |
+
+### API REST
+
+| Método | Rota | Perfil | Descrição |
+|--------|------|--------|-----------|
+| `GET` | `/api/status` | Público | JSON com status do scan (`running`, `total`, `networks_done`, etc.) |
+| `GET` | `/api/cds` | Público | JSON com lista de CDs disponíveis no cache |
+| `GET` | `/api/cd/<cd>` | Público | JSON com impressoras de um CD específico |
+| `GET` | `/api/probe?ip=<ip>` | Público | JSON com diagnóstico completo (portas TCP, HTTP, OIDs SNMP) |
+| `GET` | `/api/export-csv?cd=<cd>` | Público | Download CSV das impressoras (`cd` opcional) |
+| `POST` | `/api/set-credentials` | **Admin** | Salva credenciais de uma impressora e retesta conexão |
+| `POST` | `/api/apply-dns` | **Admin** | Aplica DNS em lote em IPs específicos ou todo CD |
+
+> Rotas marcadas como **Admin** retornam `HTTP 403` com JSON `{"error": "Não autorizado"}` quando acessadas sem sessão ativa.
 
 #### `POST /api/set-credentials` — Corpo da requisição
 
@@ -558,6 +612,7 @@ Abra `scan_printers.py` e ajuste as constantes no topo do arquivo conforme o amb
 
 | Constante | Valor padrão | Descrição |
 |-----------|-------------|-----------|
+| `ADMIN_KEY_PATH` | `admin.key` | Arquivo com a senha do painel admin |
 | `CSV_PATH` | `Redes Imps CDS/Endereçamento_Atualizado.csv` | Arquivo de redes por CD |
 | `CACHE_PATH` | `cache.json` | Cache incremental de impressoras |
 | `CREDENTIALS_PATH` | `printer_credentials.json` | Credenciais manuais por IP |
@@ -634,9 +689,13 @@ ZEBRA_PASSWORDS = ['1234', '1934', '3737', '']
 
 | Função | Descrição |
 |--------|-----------|
-| `apply_dns_config(ip, mfr, dns1, dns2)` | Aplica DNS em cascata (SNMP SET → EWS → SyncThru) |
+| `apply_dns_config(ip, mfr, dns1, dns2)` | Aplica DNS em cascata (SNMP SET → EWS → `network_id.htm` → SyncThru) |
+| `_samsung_syncthru_set_dns(ip, user, pw, dns1, dns2)` | Auth por sessão/cookie no SyncThru Samsung + aplica DNS |
+| `_snmp_set_string(ip, oid, value)` | SNMP SET com validação correta do `error-status` no SetResponse |
 | `load_printer_credentials()` | Lê `printer_credentials.json` |
 | `save_printer_credentials(creds)` | Salva `printer_credentials.json` |
+| `_load_admin_password()` | Lê `admin.key`; cria com senha `admin` na primeira execução |
+| `_check_admin_password(pw)` | Compara senha com `hmac.compare_digest` (timing-safe) |
 
 ### Diagnóstico (probe)
 
@@ -667,11 +726,12 @@ Get-NetFirewallRule -DisplayName "Scanner Impressoras*" | Select-Object DisplayN
 ```
 
 Após criar a regra, o inventário fica acessível em:
-- **Mesmo PC:** `http://localhost:5001/results`
-- **Rede local:** `http://<IP-do-PC>:5001/results`
+- **Público (qualquer usuário):** `http://<IP-do-PC>:5001/home`
+- **Admin (senha necessária):** `http://<IP-do-PC>:5001/admin`
+- **Mesmo PC:** `http://localhost:5001/home`
 - **Inventário estático offline:** abrir `inventory.html` diretamente no navegador (sem Flask)
 
-> O inventário estático `inventory.html` pode ser copiado para qualquer máquina e aberto offline. As funcionalidades que requerem o Flask (probe, aplicar DNS, modal de credenciais, exportar CSV) mostrarão erro de conexão se o servidor não estiver rodando.
+> O inventário estático `inventory.html` pode ser copiado para qualquer máquina e aberto offline. As funcionalidades que requerem o Flask (probe, aplicar DNS, modal de credenciais, exportar CSV) mostrarão aviso de servidor indisponível se o servidor não estiver rodando.
 
 ---
 
