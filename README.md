@@ -118,7 +118,7 @@ C:\Users\_araujo\AppData\Local\Python\pythoncore-3.14-64\python.exe -m pip insta
 
 | Pacote | Versão testada | Obrigatório | Uso no projeto |
 |--------|---------------|-------------|----------------|
-| `flask` | 3.1.3 | **Sim** | Servidor web HTTP na porta 5001; rotas `/home`, `/admin`, `/login`, `/probe` e API REST |
+| `flask` | 3.1.3 | **Sim** | Servidor web HTTP na porta 8080; rotas `/home`, `/admin`, `/login`, `/probe` e API REST |
 | `pandas` | 3.0.2 | **Sim** | Leitura e parsing do CSV de endereçamento de redes por CD |
 | `python-nmap` | 0.7.1 | **Sim** | Wrapper Python do executável `nmap`; realiza scan de portas 80/443/631/9100 em cada rede CIDR |
 | `pysnmp` | 7.1.26 | Recomendado | SNMP GET de alto nível via `pysnmp.hlapi`; o script possui fallback BER puro-Python se não instalado |
@@ -283,15 +283,15 @@ python scan_printers.py --probe-only
 ```
 
 Após iniciar, acesse:
-- **Inventário público:** `http://localhost:5001/home` — visualização, filtros e exportação CSV
-- **Painel admin:** `http://localhost:5001/admin` — requer senha do `admin.key`
-- **Login:** `http://localhost:5001/login`
-- **Diagnóstico:** `http://localhost:5001/probe`
+- **Inventário público:** `http://localhost:8080/home` — visualização, filtros e exportação CSV
+- **Painel admin:** `http://localhost:8080/admin` — requer senha do `admin.key`
+- **Login:** `http://localhost:8080/login`
+- **Diagnóstico:** `http://localhost:8080/probe`
 
-> O servidor Flask fica disponível em `http://0.0.0.0:5001`. Para acesso de outras máquinas da rede, veja a seção [Acesso de Rede e Firewall](#-acesso-de-rede-e-firewall).
+> O servidor Flask fica disponível em `http://0.0.0.0:8080`. Para acesso de outras máquinas da rede, veja a seção [Acesso de Rede e Firewall](#-acesso-de-rede-e-firewall).
 
 Endpoints adicionais:
-- **Healthcheck:** `http://localhost:5001/healthcheck` — verifica saúde do servidor
+- **Healthcheck:** `http://localhost:8080/healthcheck` — verifica saúde do servidor
 
 ---
 
@@ -311,7 +311,7 @@ notepad .env
 
 | Variável | Padrão | Descrição |
 |----------|--------|-----------|
-| `PROBE_PORT` | `5001` | Porta do servidor Flask |
+| `PROBE_PORT` | `8080` | Porta do servidor Flask |
 | `SNMP_COMMUNITY` | `public` | Community SNMP read-only |
 | `HTTP_TIMEOUT` | `3` | Timeout HTTP em segundos |
 | `SNMP_TIMEOUT` | `2` | Timeout SNMP em segundos |
@@ -463,7 +463,7 @@ python scan_printers.py
 ├── save_cache()                      — salva após fase B (incremental a cada rede)
 │
 ├── generate_inventory_html()         — injeta dados no template → inventory.html
-└── Flask serve :5001                 — regenera HTML a cada /results a partir do cache
+└── Flask serve :8080                 — regenera HTML a cada /results a partir do cache
 ```
 
 ---
@@ -760,15 +760,15 @@ Constantes **fixas no código** (não configuráveis por `.env`):
 
 ## 🔒 Acesso de Rede e Firewall
 
-O Flask escuta em `0.0.0.0:5001` para aceitar conexões de qualquer IP. Para permitir acesso de outras máquinas:
+O Flask escuta em `0.0.0.0:8080` para aceitar conexões de qualquer IP. Para permitir acesso de outras máquinas:
 
 ```powershell
 # Criar regra de firewall — executar como Administrador
 New-NetFirewallRule `
-  -DisplayName "Scanner Impressoras — Flask 5001" `
+  -DisplayName "Scanner Impressoras — Flask 8080" `
   -Direction Inbound `
   -Protocol TCP `
-  -LocalPort 5001 `
+  -LocalPort 8080 `
   -Action Allow `
   -Profile Any
 
@@ -777,9 +777,9 @@ Get-NetFirewallRule -DisplayName "Scanner Impressoras*" | Select-Object DisplayN
 ```
 
 Após criar a regra, o inventário fica acessível em:
-- **Público (qualquer usuário):** `http://<IP-do-PC>:5001/home`
-- **Admin (senha necessária):** `http://<IP-do-PC>:5001/admin`
-- **Mesmo PC:** `http://localhost:5001/home`
+- **Público (qualquer usuário):** `http://<IP-do-PC>:8080/home`
+- **Admin (senha necessária):** `http://<IP-do-PC>:8080/admin`
+- **Mesmo PC:** `http://localhost:8080/home`
 - **Inventário estático offline:** abrir `inventory.html` diretamente no navegador (sem Flask)
 
 > O inventário estático `inventory.html` pode ser copiado para qualquer máquina e aberto offline. As funcionalidades que requerem o Flask (probe, aplicar DNS, modal de credenciais, exportar CSV) mostrarão aviso de servidor indisponível se o servidor não estiver rodando.
@@ -804,7 +804,7 @@ cd "C:\Projetos\Impressoras"
 python -m py_compile scan_printers.py && Write-Host "SYNTAX OK"
 
 # Verificar healthcheck após iniciar o servidor
-curl http://localhost:5001/healthcheck
+curl http://localhost:8080/healthcheck
 # {"ok": true, "version": "1.0", "uptime_s": 5, "scan_running": false, "cache_size": 120}
 
 # Git — commit e push
