@@ -213,6 +213,13 @@ _MFR_KEYWORDS: dict[str, tuple[str, ...]] = {
 # Semáforo para limitar scans nmap paralelos
 _nmap_sem = threading.Semaphore(MAX_CONCURRENT)
 
+# ---------------------------------------------------------------------------
+# Status de conectividade em memória — atualizado pelo healthcheck worker
+# Separado do cache em arquivo para evitar I/O a cada ciclo de ping
+# ---------------------------------------------------------------------------
+_status_cache: dict[str, str] = {}   # ip → 'Online' | 'Offline'
+_status_lock  = threading.Lock()
+
 # Status global do scan — exposto via /api/status
 _scan_status: dict = {
     'running':         False,
@@ -1794,6 +1801,15 @@ def update_metrics_from_cache(cached: dict) -> dict:
     updated = dict(cached)
     now = datetime.now().isoformat(timespec='seconds')
 
+    # Short-circuit: se o healthcheck já marcou como Offline, não tenta
+    # SNMP/HTTP — evita acumular timeouts de 3 s em máquinas desligadas.
+    with _status_lock:
+        current_status = _status_cache.get(ip)
+    if current_status == 'Offline':
+        updated['status']       = 'Offline'
+        updated['last_updated'] = now
+        return updated
+
     # Re-detecta fabricante se 'Desconhecido' ou vazio
     if not mfr or mfr == 'Desconhecido':
         detected = detect_manufacturer(ip)
@@ -1853,6 +1869,72 @@ def update_metrics_from_cache(cached: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Diagnóstico de conectividade — /api/probe
 # ---------------------------------------------------------------------------
+
+def _check_is_online(ip: str, timeout: float = 1.5) -> bool:
+    """TCP handshake na porta 80 — detecta se a impressora está acessível.
+    Porta 9100 (RAW/SGD) não é usada: bloqueada por firewall nos CDs.
+    """
+    try:
+        with socket.create_connection((ip, 80), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def _healthcheck_loop() -> None:
+    """Worker daemon que atualiza _status_cache a cada 120 s.
+
+    Estratégia:
+    - Lê a lista de IPs do cache em arquivo (snapshot, sem lock de arquivo)
+    - Testa conectividade via TCP 80 em paralelo (max 30 workers)
+    - Atualiza apenas _status_cache (dict em memória, com _status_lock mínimo)
+    - Loga APENAS mudanças de estado para não poluir automacao.log
+    - Intervalo de 120 s reduz o risco de saturação em redes SD-WAN
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    _HC_INTERVAL   = 120   # segundos entre ciclos
+    _HC_MAX_WORKERS = 30   # paralelismo — ~800 IPs ÷ 30 = 27 lotes de ~1.5 s
+
+    log.info('[healthcheck] Worker iniciado. Intervalo: %d s, workers: %d.',
+             _HC_INTERVAL, _HC_MAX_WORKERS)
+
+    while True:
+        try:
+            time.sleep(_HC_INTERVAL)
+
+            # Snapshot dos IPs conhecidos (leitura de arquivo; aceita ser ligeiramente defasado)
+            try:
+                ip_list = list(load_cache().keys())
+            except Exception as _e:
+                log.warning('[healthcheck] Erro ao ler cache: %s', _e)
+                continue
+
+            if not ip_list:
+                continue
+
+            def _ping(ip: str) -> tuple[str, bool]:
+                return ip, _check_is_online(ip)
+
+            with ThreadPoolExecutor(max_workers=_HC_MAX_WORKERS,
+                                    thread_name_prefix='hc') as ex:
+                futures = {ex.submit(_ping, ip): ip for ip in ip_list}
+                for fut in as_completed(futures):
+                    try:
+                        ip, online = fut.result()
+                        new_status = 'Online' if online else 'Offline'
+                        with _status_lock:
+                            old_status = _status_cache.get(ip)
+                            if old_status != new_status:
+                                log.info('[healthcheck] %s: %s → %s',
+                                         ip, old_status or 'Novo', new_status)
+                            _status_cache[ip] = new_status
+                    except Exception as _fe:
+                        log.debug('[healthcheck] Erro em future: %s', _fe)
+
+        except Exception as _exc:
+            log.warning('[healthcheck] Falha no ciclo: %s', _exc)
+
 
 def _probe_tcp(ip: str, port: int) -> dict:
     """Testa abertura de uma porta TCP."""
@@ -2488,6 +2570,16 @@ def _register_routes(flask_app, req, jsonify_fn, render_tmpl):
         """Status do scan em andamento."""
         return jsonify_fn(dict(_scan_status))
 
+    @flask_app.route('/api/online-status')
+    def api_online_status():
+        """Retorna o status de conectividade em memória para todos os IPs.
+        O frontend usa este endpoint para atualizar os badges dinamicamente
+        sem recarregar a página.
+        """
+        with _status_lock:
+            snapshot = dict(_status_cache)
+        return jsonify_fn(snapshot)
+
     @flask_app.route('/healthcheck')
     def healthcheck():
         """Verifica se o servidor está saudável e retorna métricas básicas."""
@@ -2894,6 +2986,14 @@ def main() -> None:
         name='bg-scheduler',
     ).start()
     log.info('[scheduler] Thread bg-scheduler registrada.')
+
+    # Healthcheck worker — mantém _status_cache atualizado (TCP 80, 120 s)
+    threading.Thread(
+        target=_healthcheck_loop,
+        daemon=True,
+        name='hc-worker',
+    ).start()
+    log.info('[healthcheck] Thread hc-worker registrada.')
 
     # Importa Flask lazy — só aqui, após o scan já estar rodando em background
     flask_app = _get_flask_app()

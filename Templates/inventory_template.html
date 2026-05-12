@@ -142,8 +142,12 @@ tbody tr:hover { background: #1f2235; }
 .tipo-badge { font-size: .65rem; font-weight: 700; padding: 1px 7px; border-radius: 5px; border: 1px solid; text-transform: uppercase; }
 .tipo-laser   { background: #1a2a4a; color: #60a5fa; border-color: #2d4a8a; }
 .tipo-termica { background: #2a1f0a; color: #fbbf24; border-color: #7c5a0a; }
-.status-online { display: inline-flex; align-items: center; gap: 5px; font-size: .75rem; font-weight: 600; color: #4ade80; }
-.status-online::before { content: ""; width: 6px; height: 6px; background: #4ade80; border-radius: 50%; box-shadow: 0 0 6px #4ade80; }
+.status-online  { display: inline-flex; align-items: center; gap: 5px; font-size: .75rem; font-weight: 600; color: #4ade80; }
+.status-online::before  { content: ""; width: 6px; height: 6px; background: #4ade80; border-radius: 50%; box-shadow: 0 0 6px #4ade80; }
+.status-offline { display: inline-flex; align-items: center; gap: 5px; font-size: .75rem; font-weight: 600; color: #94a3b8; }
+.status-offline::before { content: ""; width: 6px; height: 6px; background: #475569; border-radius: 50%; }
+.status-unknown { display: inline-flex; align-items: center; gap: 5px; font-size: .75rem; font-weight: 600; color: #64748b; }
+.status-unknown::before { content: ""; width: 6px; height: 6px; background: #334155; border-radius: 50%; }
 .ts-cell { font-size: .68rem; color: #475569; white-space: nowrap; }
 
 /* ---- DNS ---- */
@@ -658,7 +662,11 @@ function makeRow(p) {
     '<td>' + tonerHtml + '</td>' +
     '<td>' + c2Html + '</td>' +
     '<td><span class="tipo-badge ' + tipoClass + '">' + tipoLabel + '</span></td>' +
-    '<td><span class="status-online">Online</span></td>' +
+    (function() {
+      var st = p.status || 'Online';
+      var cls = st === 'Online' ? 'status-online' : (st === 'Offline' ? 'status-offline' : 'status-unknown');
+      return '<td><span class="' + cls + '" data-ip="' + esc(p.ip) + '">' + st + '</span></td>';
+    })() +
     '<td>' + hnHtml + '</td>' +
     '<td class="' + (d1Bad ? 'td-dns-bad' : '') + '">' + d1Html + '</td>' +
     '<td class="' + (d2Bad ? 'td-dns-bad' : '') + '">' + d2Html + '</td>' +
@@ -742,6 +750,33 @@ function clearFilters(refilter) {
 // ---- Init ----------------------------------------------------------
 buildCdList();
 if (ALL_CDS.length === 1) selectCd(ALL_CDS[0]);
+
+// ---- Healthcheck polling — atualiza badges de status sem recarregar ----
+(function() {
+  // Só executa via Flask (not file://)
+  if (window.location.protocol === 'file:') return;
+  var _HC_INTERVAL_MS = 30000; // 30 s — mais frequente que o worker (120 s) para capturar mudanças
+  function _updateBadges() {
+    fetch(PROBE_BASE + '/api/online-status', {credentials: 'same-origin'})
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(data) {
+        if (!data) return;
+        document.querySelectorAll('[data-ip]').forEach(function(el) {
+          var ip = el.getAttribute('data-ip');
+          var st = data[ip];
+          if (!st) return;
+          var cls = st === 'Online' ? 'status-online' : (st === 'Offline' ? 'status-offline' : 'status-unknown');
+          if (el.className !== cls || el.textContent !== st) {
+            el.className  = cls;
+            el.textContent = st;
+          }
+        });
+      })
+      .catch(function() {}); // silencia erros de rede
+  }
+  setTimeout(_updateBadges, 5000);  // primeiro ping 5 s após carregamento
+  setInterval(_updateBadges, _HC_INTERVAL_MS);
+})();
 
 // ---- DNS config globals & helpers ----------------------------------
 var targetDns1       = '';
