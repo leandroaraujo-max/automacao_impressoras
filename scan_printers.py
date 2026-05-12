@@ -475,7 +475,10 @@ def _with_retry(fn, *, attempts: int = 3, base_delay: float = 1.0):
     """
     import random
     for attempt in range(attempts):
-        result = fn()
+        try:
+            result = fn()
+        except Exception:
+            result = None
         if result is not None:
             return result
         if attempt < attempts - 1:
@@ -2391,7 +2394,11 @@ def _register_routes(flask_app, req, jsonify_fn, render_tmpl):
                     results.append({'ip': ip, 'ok': False,
                                     'detail': f'Fabricante {mfr!r} sem suporte'})
                 return
-            r = apply_dns_config(ip, mfr, dns1, dns2)
+            try:
+                r = apply_dns_config(ip, mfr, dns1, dns2)
+            except Exception as _exc:
+                log.error(f'[apply_dns] {ip} exceção não tratada: {_exc}', exc_info=True)
+                r = {'ok': False, 'method': 'exception', 'detail': str(_exc)[:100]}
             # Persiste status no cache
             if r['ok']:
                 p['dns1'] = dns1

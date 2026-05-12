@@ -175,6 +175,12 @@ td.td-dns-bad { background: rgba(239,68,68,.1); }
 }
 .btn-apply-dns:hover { opacity: .8; }
 .btn-apply-dns:disabled { opacity: .4; cursor: not-allowed; }
+@keyframes dns-spin { to { transform: rotate(360deg); } }
+.dns-spinner {
+  display: inline-block;
+  animation: dns-spin .9s linear infinite;
+  margin-right: 4px;
+}
 .dns-apply-log {
   margin-top: 12px; background: #0f1117; border: 1px solid #2d3148;
   border-radius: 8px; padding: 10px 12px; max-height: 220px; overflow-y: auto;
@@ -868,13 +874,20 @@ function applyDnsAction() {
   });
   if (!ips.length) { alert('Nenhuma impressora visível com DNS incorreto.'); return; }
 
+  var btn = document.getElementById('btn-apply-dns');
   var logEl = document.getElementById('dns-apply-log');
+
+  // --- Estado de carregamento ---
+  btn.disabled = true;
+  btn.innerHTML = '<span class="dns-spinner">&#9696;</span> Aplicando ' + ips.length + ' impressora(s)...';
   logEl.style.display = '';
-  logEl.textContent = '\u21bb Aplicando DNS em ' + ips.length + ' impressora(s)...\n';
-  document.getElementById('btn-apply-dns').disabled = true;
+  logEl.innerHTML = '<span class="dns-spinner">&#9696;</span> Aguardando resposta do servidor...\n'
+    + 'Isso pode levar at\u00e9 2 minutos para muitas impressoras.\n'
+    + 'N\u00e3o feche esta p\u00e1gina.';
 
   fetch('/api/apply-dns', {
     method: 'POST',
+    credentials: 'same-origin',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({dns1: dns1, dns2: dns2, ips: ips})
   })
@@ -887,7 +900,6 @@ function applyDnsAction() {
            + (r.detail || r.method || '') + '\n';
     });
     logEl.textContent = msg;
-    document.getElementById('btn-apply-dns').disabled = false;
     // Atualiza dados locais e re-renderiza
     (data.results || []).forEach(function(r) {
       if (r.ok) {
@@ -902,7 +914,10 @@ function applyDnsAction() {
   })
   .catch(function(e) {
     logEl.textContent = 'Erro: ' + String(e);
-    document.getElementById('btn-apply-dns').disabled = false;
+  })
+  .finally(function() {
+    btn.disabled = false;
+    btn.innerHTML = '&#9889; Aplicar nos incorretos';
   });
 }
 
