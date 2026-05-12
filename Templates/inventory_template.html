@@ -777,16 +777,27 @@ function startScan(updateOnly) {
 
   fetch(PROBE_BASE + '/api/scan/start', {
     method: 'POST',
+    credentials: 'same-origin',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({update_only: !!updateOnly}),
   })
-  .then(function(r) { return r.json(); })
+  .then(function(r) {
+    if (!r.ok) {
+      return r.text().then(function(t) {
+        var hint = t.trim().startsWith('<')
+          ? 'Resposta HTML recebida — o servidor precisa ser reiniciado para aplicar a atualização.'
+          : t.slice(0, 300);
+        throw new Error('HTTP ' + r.status + ': ' + hint);
+      });
+    }
+    return r.json();
+  })
   .then(function(d) {
     if (d.error) { alert('Erro: ' + d.error); return; }
     _setScanRunning(true);
     _pollScanStatus();
   })
-  .catch(function(e) { alert('Erro ao iniciar scan: ' + e); });
+  .catch(function(e) { alert('Erro ao iniciar scan:\n' + e.message); });
 }
 
 function _setScanRunning(running) {
