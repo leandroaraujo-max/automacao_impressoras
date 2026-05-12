@@ -681,8 +681,44 @@ def _snmp_set_string(ip: str, oid: str, value: str) -> bool:
             s.settimeout(SNMP_TIMEOUT)
             s.sendto(pkt, (ip, 161))
             resp, _ = s.recvfrom(1024)
-        # Verifica se recebeu SetResponse (0xa2) sem erro
-        return len(resp) > 6 and resp[0] == 0x30
+        # Parseia o SetResponse SNMP corretamente.
+        # resp[0] == 0x30 e sempre verdadeiro para QUALQUER pacote SNMP (incluindo erros).
+        # Precisa verificar:
+        #   1. O PDU type e 0xa2 (SetResponse, nao GetResponse ou error)
+        #   2. error-status == 0 (noError)
+        if len(resp) < 10 or resp[0] != 0x30:
+            return False
+        i = 1
+        # Skip outer SEQUENCE length (suporta forma longa 0x81/0x82)
+        i += (resp[i] & 0x7f) + 1 if (resp[i] & 0x80) else 1
+        # Skip version INTEGER (0x02 0x01 0x00)
+        if i >= len(resp) or resp[i] != 0x02: return False
+        i += 2 + resp[i + 1]
+        # Skip community OCTET STRING (0x04 len bytes...)
+        if i >= len(resp) or resp[i] != 0x04: return False
+        i += 2 + resp[i + 1]
+        # PDU type deve ser 0xa2 (SetResponse-PDU)
+        # 0xa2 = GetResponse-PDU tag, reutilizado por Set; qualquer outro = erro/rejeicao
+        if i >= len(resp) or resp[i] != 0xa2:
+            log.debug(f'[snmp_set] {ip} OID={oid} PDU type inesperado: {resp[i] if i < len(resp) else "EOF"}')
+            return False
+        i += 1
+        # Skip PDU length
+        i += (resp[i] & 0x7f) + 1 if (resp[i] & 0x80) else 1
+        # Skip request-id INTEGER
+        if i >= len(resp) or resp[i] != 0x02: return False
+        i += 2 + resp[i + 1]
+        # Ler error-status INTEGER — deve ser 0 (noError)
+        # Codigos comuns: 1=tooBig, 2=noSuchName, 3=badValue, 4=readOnly, 5=genErr
+        if i >= len(resp) or resp[i] != 0x02: return False
+        i += 1
+        elen = resp[i]; i += 1
+        err_status = int.from_bytes(resp[i:i + elen], 'big')
+        if err_status != 0:
+            _err_names = {1:'tooBig',2:'noSuchName',3:'badValue',4:'readOnly',5:'genErr'}
+            log.debug(f'[snmp_set] {ip} OID={oid} error-status={err_status} ({_err_names.get(err_status,"?")})')
+            return False
+        return True
     except Exception as e:
         log.debug(f'[snmp_set] {ip} OID={oid} erro: {e}')
         return False
@@ -741,24 +777,35 @@ def apply_dns_config(ip: str, manufacturer: str,
         # --- Tentativa 1: SNMP SET ---
         ok1 = _snmp_set_string(ip, OID_HP_DNS_PRIMARY,   dns1)
         ok2 = _snmp_set_string(ip, OID_HP_DNS_SECONDARY, dns2)
-        if ok1 or ok2:
+        if ok1 and ok2:
             result = {'ok': True, 'method': 'SNMP SET JetDirect',
-                      'detail': f'DNS1={dns1} DNS2={dns2} (SNMP ok1={ok1} ok2={ok2})'}
+                      'detail': f'DNS1={dns1} DNS2={dns2}'}
             log.info(f'[apply_dns] {ip} HP SNMP SET ok: {dns1}/{dns2}')
             return result
 
-        # --- Tentativa 2: EWS HTTP e SyncThru (multi user/senha, com e sem HTTPS) ---
+        # --- Tentativa 2: EWS HTTP, network_id.htm e SyncThru ---
         import urllib.parse, json as _json
+
+        # EWS SetStaticDNS (HP LaserJet tradicionais)
         payload_ews = urllib.parse.urlencode({
             'PreferredDNSServer': dns1, 'AlternateDNSServer': dns2,
         })
+        # network_id.htm — pagina de identificacao de rede HP E60165 e similares
+        # Tenta varios nomes de campo comuns usados pelo EWS desta geracao
+        payload_netid_v1 = urllib.parse.urlencode({
+            'primaryDNS': dns1, 'secondaryDNS': dns2,
+        })
+        payload_netid_v2 = urllib.parse.urlencode({
+            'dnsServer1': dns1, 'dnsServer2': dns2,
+        })
+        # SyncThru (HP Laser 408 e similares Samsung-based HP)
         payload_sws = _json.dumps({
             'networkSetting': {'tcpip': {'dns': {'primaryDns': dns1, 'secondaryDns': dns2}}}
         })
         for use_https in (True, False):
             for u in HP_EWS_USERS:
                 for pw in HP_EWS_PASSWORDS:
-                    # EWS JetDirect
+                    # EWS JetDirect (HP LaserJet Pro/Enterprise classico)
                     resp = _http_post_authenticated(
                         ip, '/hp/device/IPConfiguration/SetStaticDNS',
                         payload_ews, u, pw, use_https=use_https)
@@ -767,6 +814,16 @@ def apply_dns_config(ip: str, manufacturer: str,
                                   'detail': f'DNS1={dns1} DNS2={dns2} user={u}'}
                         log.info(f'[apply_dns] {ip} HP EWS ok: {dns1}/{dns2}')
                         return result
+                    # network_id.htm — HP LaserJet E60165 / E series
+                    for nid_payload in (payload_netid_v1, payload_netid_v2):
+                        resp = _http_post_authenticated(
+                            ip, '/network_id.htm',
+                            nid_payload, u, pw, use_https=use_https)
+                        if resp is not None and len(resp) > 50:
+                            result = {'ok': True, 'method': f'network_id.htm HTTP{"S" if use_https else ""}',
+                                      'detail': f'DNS1={dns1} DNS2={dns2} user={u}'}
+                            log.info(f'[apply_dns] {ip} HP network_id.htm ok: {dns1}/{dns2}')
+                            return result
                     # SyncThru (HP Laser 408 etc)
                     for sws_path in ('/sws/swsapi/swsconfig?subtype=networkSetting',
                                      '/sws/app/information/network/networkSetting'):
@@ -779,7 +836,7 @@ def apply_dns_config(ip: str, manufacturer: str,
                             log.info(f'[apply_dns] {ip} HP SyncThru ok: {dns1}/{dns2}')
                             return result
 
-        result['detail'] = 'SNMP SET sem resposta, EWS/SyncThru sem resposta — verifique credenciais'
+        result['detail'] = 'SNMP SET falhou (community sem escrita ou OID bloqueado); EWS/network_id.htm sem resposta — verifique credenciais e HTTPS'
 
     elif manufacturer == 'Samsung':
         import json as _json, urllib.parse
