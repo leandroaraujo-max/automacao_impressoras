@@ -73,6 +73,7 @@ CSV_PATH       = BASE_DIR / 'Redes Imps CDS' / 'Endereçamento_Atualizado.csv'
 INVENTORY_PATH        = BASE_DIR / 'inventory.html'
 CACHE_PATH            = BASE_DIR / 'cache.json'
 CREDENTIALS_PATH      = BASE_DIR / 'printer_credentials.json'
+ADMIN_KEY_PATH        = BASE_DIR / 'admin.key'
 TEMPLATE_PATH         = BASE_DIR / 'Templates' / 'inventory_template.html'
 PROBE_PORT     = 5001
 
@@ -81,6 +82,31 @@ SNMP_TIMEOUT    = 2
 HTTP_TIMEOUT    = 3
 NMAP_ARGS       = '-p 80,443,631,9100 --open -T4'
 MAX_CONCURRENT  = 10
+
+# ---------------------------------------------------------------------------
+# Admin auth helpers
+# ---------------------------------------------------------------------------
+def _load_admin_password() -> str:
+    """Carrega a senha do admin de admin.key.
+    Se o arquivo não existir, cria com senha padrão 'admin' e avisa."""
+    import hashlib
+    if ADMIN_KEY_PATH.exists():
+        return ADMIN_KEY_PATH.read_text(encoding='utf-8').strip()
+    # Primeira execução — cria arquivo com senha padrão
+    default = 'admin'
+    ADMIN_KEY_PATH.write_text(default, encoding='utf-8')
+    log.warning(
+        f'Arquivo admin.key criado com senha padrão "{default}". '
+        'Altere o conteúdo do arquivo para uma senha segura.'
+    )
+    return default
+
+
+def _check_admin_password(password: str) -> bool:
+    """Compara a senha fornecida com a do admin.key (timing-safe)."""
+    import hmac
+    expected = _load_admin_password()
+    return hmac.compare_digest(password.encode(), expected.encode())
 
 # ---- OIDs -------------------------------------------------------------------
 # RFC 3805 (Standard Printer MIB)
@@ -172,9 +198,11 @@ def _get_flask_app():
     if _flask_app is not None:
         return _flask_app
     from flask import Flask, jsonify, render_template, request as flask_request
-    import logging as _pylog
+    import logging as _pylog, os as _os
     _pylog.getLogger('werkzeug').setLevel(_pylog.WARNING)
     _flask_app = Flask(__name__)
+    # secret_key para sessões: usa arquivo admin.key como semente
+    _flask_app.secret_key = _load_admin_password() + '_session_salt_v1'
     _register_routes(_flask_app, flask_request, jsonify, render_template)
     return _flask_app
 
@@ -1876,7 +1904,8 @@ def run_full_scan(update_only: bool = False) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Geração do HTML estático de inventário
 # ---------------------------------------------------------------------------
-def generate_inventory_html(printers: list[dict], output_path: Path) -> None:
+def generate_inventory_html(printers: list[dict], output_path: Path,
+                            is_admin: bool = False) -> None:
     """Lê o template, injeta os dados e grava o inventory.html."""
     if not TEMPLATE_PATH.exists():
         log.error(f'Template não encontrado: {TEMPLATE_PATH}')
@@ -1900,32 +1929,141 @@ def generate_inventory_html(printers: list[dict], output_path: Path) -> None:
             TIMESTAMP=timestamp,
             PROBE_PORT=str(PROBE_PORT),
             TOTAL=total,
+            IS_ADMIN='true' if is_admin else 'false',
         )
     )
     output_path.write_text(html, encoding='utf-8')
-    log.info(f'Inventário gerado: {output_path}  ({total} impressoras)')
+    log.info(f'Inventário gerado ({"admin" if is_admin else "público"}): '
+             f'{output_path}  ({total} impressoras)')
 
+
+# ---------------------------------------------------------------------------
+# Página de login (HTML inline — sem dependência de arquivo externo)
+# ---------------------------------------------------------------------------
+_LOGIN_HTML = """<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Login — Painel Admin</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:"Segoe UI",system-ui,sans-serif;background:#0f1117;color:#e2e8f0;
+     display:flex;align-items:center;justify-content:center;min-height:100vh}
+.card{background:#1a1d27;border:1px solid #2d3148;border-radius:14px;
+      padding:2.5rem 2rem;width:100%;max-width:360px;display:flex;flex-direction:column;gap:1.2rem}
+h1{font-size:1.1rem;font-weight:700;color:#f1f5f9;text-align:center}
+label{font-size:.75rem;color:#64748b;font-weight:600;text-transform:uppercase;
+      letter-spacing:.5px;display:block;margin-bottom:4px}
+input{width:100%;background:#0f1117;border:1px solid #2d3148;border-radius:8px;
+      color:#e2e8f0;padding:9px 12px;font-size:.9rem;outline:none}
+input:focus{border-color:#3b82f6}
+button{background:#1d4ed8;color:#fff;border:none;border-radius:8px;padding:10px;
+       font-size:.9rem;font-weight:600;cursor:pointer;transition:opacity .15s}
+button:hover{opacity:.85}
+.err{background:#2a0a0a;border:1px solid #7f1d1d;border-radius:8px;
+     color:#fca5a5;padding:9px 12px;font-size:.82rem;text-align:center}
+.pub-link{text-align:center;font-size:.78rem;color:#64748b}
+.pub-link a{color:#60a5fa;text-decoration:none}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>&#128274;&#160;Painel Administrativo</h1>
+  {{ERROR_BLOCK}}
+  <form method="POST" autocomplete="off">
+    <div>
+      <label for="password">Senha de acesso</label>
+      <input type="password" id="password" name="password" autofocus required>
+    </div>
+    <button type="submit">Entrar</button>
+  </form>
+  <p class="pub-link">Acesso somente leitura? <a href="/home">Abrir inventário público</a></p>
+</div>
+</body>
+</html>"""
 
 # ---------------------------------------------------------------------------
 # Rotas Flask — registradas via função para suportar import lazy
 # ---------------------------------------------------------------------------
 def _register_routes(flask_app, req, jsonify_fn, render_tmpl):
     """Registra todas as rotas no app Flask passado como argumento."""
+    from flask import session, redirect, url_for, Response as FlaskResponse
 
-    @flask_app.route('/results')
-    def results():
-        """Regenera o inventário a partir do cache + template e serve."""
+    # ---- Auth helpers ----
+    def _is_admin() -> bool:
+        return session.get('is_admin') is True
+
+    def _require_admin():
+        """Retorna resposta de erro se não for admin; None se OK."""
+        if not _is_admin():
+            return jsonify_fn({'error': 'Não autorizado. Faça login em /admin'}), 403
+        return None
+
+    # ---- /login ----
+    @flask_app.route('/login', methods=['GET', 'POST'])
+    def login():
+        error = ''
+        if req.method == 'POST':
+            pw = req.form.get('password', '')
+            if _check_admin_password(pw):
+                session['is_admin'] = True
+                next_url = req.args.get('next', '/admin')
+                return redirect(next_url)
+            error = '<div class="err">Senha incorreta. Tente novamente.</div>'
+        # Página de login inline (sem template externo)
+        return FlaskResponse(_LOGIN_HTML.replace('{{ERROR_BLOCK}}', error),
+                             mimetype='text/html; charset=utf-8')
+
+    # ---- /logout ----
+    @flask_app.route('/logout')
+    def logout():
+        session.clear()
+        return redirect('/home')
+
+    # ---- /home  (leitura pública) ----
+    @flask_app.route('/')
+    @flask_app.route('/home')
+    def home():
+        """Inventário público — somente leitura."""
         cache = load_cache()
         if not cache and not _scan_status['running']:
-            return (
+            return FlaskResponse(
                 '<p style="font-family:sans-serif;padding:2rem;color:#ccc">'
-                'Cache vazio. Execute <code>scan_printers.py</code> primeiro.</p>'
-            ), 404
+                'Cache vazio. Peça ao administrador para executar um scan.</p>',
+                status=404, mimetype='text/html'
+            )
         printers = list(cache.values())
-        generate_inventory_html(printers, INVENTORY_PATH)
+        generate_inventory_html(printers, INVENTORY_PATH, is_admin=False)
         return INVENTORY_PATH.read_text(encoding='utf-8'), 200, {
             'Content-Type': 'text/html; charset=utf-8'
         }
+
+    # ---- /admin  (requer login) ----
+    @flask_app.route('/admin')
+    def admin():
+        """Inventário administrativo — funcionalidades completas."""
+        if not _is_admin():
+            return redirect('/login?next=/admin')
+        cache = load_cache()
+        if not cache and not _scan_status['running']:
+            return FlaskResponse(
+                '<p style="font-family:sans-serif;padding:2rem;color:#ccc">'
+                'Cache vazio. Execute <code>scan_printers.py</code> primeiro.</p>',
+                status=404, mimetype='text/html'
+            )
+        printers = list(cache.values())
+        generate_inventory_html(printers, INVENTORY_PATH, is_admin=True)
+        return INVENTORY_PATH.read_text(encoding='utf-8'), 200, {
+            'Content-Type': 'text/html; charset=utf-8'
+        }
+
+    # ---- /results  (redirect legado) ----
+    @flask_app.route('/results')
+    def results_legacy():
+        """Redireciona URLs antigas para /home."""
+        return redirect('/home')
+
 
     @flask_app.route('/api/status')
     def api_status():
@@ -2052,12 +2190,9 @@ def _register_routes(flask_app, req, jsonify_fn, render_tmpl):
 
     @flask_app.route('/api/set-credentials', methods=['POST'])
     def api_set_credentials():
-        """Salva credenciais por IP e recoleta configuracao de rede.
-
-        Body JSON: { "ip": "x.x.x.x", "user": "admin", "password": "senha" }
-        Para remover credencial: omite ou deixa vazio o campo 'user'.
-        Retorna: { "ok": true, "auth_ok": bool|null, "auth_user": str, "netcfg": {...} }
-        """
+        """[ADMIN] Salva credenciais por IP e recoleta configuracao de rede."""
+        err = _require_admin()
+        if err: return err
         import json as _json
         try:
             body = _json.loads(req.get_data(as_text=True) or '{}')
@@ -2105,15 +2240,9 @@ def _register_routes(flask_app, req, jsonify_fn, render_tmpl):
 
     @flask_app.route('/api/apply-dns', methods=['POST'])
     def api_apply_dns():
-        """Aplica DNS em uma ou mais impressoras.
-
-        Body JSON:
-          { "dns1": "X.X.X.X", "dns2": "X.X.X.X",
-            "ips": ["X.X.X.X", ...] }   -- lista específica, OU
-          { "dns1": "X.X.X.X", "dns2": "X.X.X.X",
-            "all_pending": true,
-            "target_dns1": "...", "target_dns2": "..." }  -- todos com DNS divergente
-        """
+        """[ADMIN] Aplica DNS em uma ou mais impressoras."""
+        err = _require_admin()
+        if err: return err
         import json as _json
         try:
             body = _json.loads(req.get_data(as_text=True) or '{}')
@@ -2245,10 +2374,12 @@ def _scan_and_open(update_only: bool = False) -> None:
         mode = 'atualização incremental' if update_only else 'scan completo'
         print(f'[3/3] Iniciando {mode}...')
         printers = run_full_scan(update_only=update_only)
-        generate_inventory_html(printers, INVENTORY_PATH)
-        url = INVENTORY_PATH.as_uri()
-        webbrowser.open(url)
-        log.info(f'Inventário aberto no browser: {url}')
+        generate_inventory_html(printers, INVENTORY_PATH, is_admin=False)
+        # Abre diretamente o /home no browser se Flask já estiver rodando,
+        # senão abre o arquivo local (modo offline)
+        local_url = f'http://127.0.0.1:{PROBE_PORT}/home'
+        webbrowser.open(local_url)
+        log.info(f'Inventário disponível em: {local_url}')
     except Exception as exc:
         log.error(f'Erro no scan: {exc}', exc_info=True)
 
@@ -2285,9 +2416,11 @@ def main() -> None:
     import socket as _sock
     _local_ip = _sock.gethostbyname(_sock.gethostname())
     print('Servidor acessível em:')
-    print(f'  Inventário (local) : http://127.0.0.1:{PROBE_PORT}/results')
-    print(f'  Inventário (rede)  : http://{_local_ip}:{PROBE_PORT}/results')
-    print(f'  Probe              : http://{_local_ip}:{PROBE_PORT}/probe')
+    print(f'  Visualização pública : http://127.0.0.1:{PROBE_PORT}/home')
+    print(f'  Painel admin         : http://127.0.0.1:{PROBE_PORT}/admin  (requer login)')
+    print(f'  Rede local (público) : http://{_local_ip}:{PROBE_PORT}/home')
+    print(f'  Rede local (admin)   : http://{_local_ip}:{PROBE_PORT}/admin')
+    print(f'  Probe de diagnóstico : http://{_local_ip}:{PROBE_PORT}/probe')
     flask_app.run(host='0.0.0.0', port=PROBE_PORT, debug=False, use_reloader=False)
 
 

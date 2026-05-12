@@ -186,6 +186,14 @@ td.td-dns-bad { background: rgba(239,68,68,.1); }
 .auth-ok   { color:#4ade80; }
 .auth-fail { color:#f87171; }
 .auth-none { color:#475569; }
+/* ---- Role badge ---- */
+.role-badge { font-size:.7rem; font-weight:700; padding:2px 9px; border-radius:5px;
+  border:1px solid; text-transform:uppercase; letter-spacing:.5px; }
+.role-admin  { background:#0c2044; border-color:#1e3a6e; color:#60a5fa; }
+.role-public { background:#1a1208; border-color:#5a3e08; color:#fbbf24; }
+.btn-auth-nav { background:none; border:1px solid #2d3148; color:#94a3b8;
+  padding:4px 12px; border-radius:6px; font-size:.78rem; cursor:pointer; text-decoration:none; }
+.btn-auth-nav:hover { border-color:#475569; color:#e2e8f0; }
 /* ---- Export button ---- */
 .btn-export { background:#0f2a1a; border:1px solid #1a5c30; color:#4ade80; padding:6px 14px;
   border-radius:7px; font-size:.78rem; font-weight:600; cursor:pointer; white-space:nowrap; }
@@ -248,13 +256,15 @@ td.td-dns-bad { background: rgba(239,68,68,.1); }
     exportar CSV &middot; aplicar DNS &middot; modal de credenciais &middot; probe de conectividade.<br>
     Para habilit&aacute;-las, inicie o servidor e acesse pelo navegador:<br>
     <code>python scan_printers.py --probe-only</code> &nbsp;&rarr;&nbsp;
-    <a href="http://127.0.0.1:$PROBE_PORT/results" target="_blank" style="color:#fbbf24">http://127.0.0.1:$PROBE_PORT/results</a>
+    <a href="http://127.0.0.1:$PROBE_PORT/home" target="_blank" style="color:#fbbf24">http://127.0.0.1:$PROBE_PORT/home</a>
   </div>
   <div class="topbar">
     <h1 id="main-title">&#128424; Selecione um CD</h1>
     <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
       <button class="btn-export" onclick="exportCSV()" title="Exportar dados vis&iacute;veis como CSV">&#8659; Exportar CSV</button>
       <span class="ts-badge">Invent&aacute;rio: $TIMESTAMP</span>
+      <span id="role-badge" class="role-badge"></span>
+      <span id="auth-nav"></span>
     </div>
   </div>
 
@@ -315,8 +325,8 @@ td.td-dns-bad { background: rgba(239,68,68,.1); }
     <span class="visible-count" id="visible-count"></span>
   </div>
 
-  <!-- ---- DNS Config panel ---- -->
-  <div class="dns-panel" id="dns-panel">
+  <!-- ---- DNS Config panel — somente admin ---- -->
+  <div class="dns-panel" id="dns-panel" style="display:none">
     <div class="dns-panel-hdr" onclick="toggleDnsPanel()">
       <h3>&#128337; DNS Alvo</h3>
       <span id="dns-badge-ok"  class="dns-badge-ok"  style="display:none">Todos OK</span>
@@ -358,6 +368,29 @@ const ALL_CDS      = $CDS;
 const PROBE_BASE   = (window.location.protocol === 'file:')
     ? 'http://127.0.0.1:$PROBE_PORT'
     : window.location.origin;
+const IS_ADMIN     = ($IS_ADMIN === true || '$IS_ADMIN' === 'true');
+
+// ---- Inicializa UI de acordo com o perfil ----
+(function _initRoleUI() {
+  // Badge de perfil
+  var badge = document.getElementById('role-badge');
+  if (badge) {
+    badge.textContent = IS_ADMIN ? 'Admin' : 'Público';
+    badge.className = 'role-badge ' + (IS_ADMIN ? 'role-admin' : 'role-public');
+  }
+  // Botão de navegação auth
+  var nav = document.getElementById('auth-nav');
+  if (nav) {
+    if (IS_ADMIN) {
+      nav.innerHTML = '<a href="/logout" class="btn-auth-nav" title="Sair do painel admin">&#128275; Sair</a>';
+    } else {
+      nav.innerHTML = '<a href="/admin" class="btn-auth-nav" title="Acessar painel administrativo">&#128274; Admin</a>';
+    }
+  }
+  // Painel DNS: apenas admin
+  var dnsPanel = document.getElementById('dns-panel');
+  if (dnsPanel) dnsPanel.style.display = IS_ADMIN ? '' : 'none';
+})();
 
 // Índice por CD
 var BY_CD = {};
@@ -561,15 +594,17 @@ function makeRow(p) {
   var gwHtml   = gwv   ? '<span class="dns-cell">' + esc(gwv)   + '</span>' : '<span class="dns-cell na">\u2014</span>';
   var modeHtml = modev ? '<span class="dns-cell">' + esc(modev) + '</span>' : '<span class="dns-cell na">\u2014</span>';
 
-  // Auth status icon
+  // Auth status icon — apenas admin pode clicar para configurar credenciais
   var authOkNum = p.auth_ok === true ? 1 : (p.auth_ok === false ? 0 : -1);
   var authCls   = p.auth_ok === true ? 'auth-ok' : (p.auth_ok === false ? 'auth-fail' : 'auth-none');
   var authTip   = p.auth_ok === true
-    ? '\u2713 Web auth OK: ' + esc(p.auth_user || '') + ' \u2014 clique para reconfigurar'
-    : (p.auth_ok === false ? '\u2717 Falha no login web \u2014 clique para configurar credenciais' : 'Login web n\u00e3o tentado \u2014 clique para configurar');
-  var authIcon = '<span class="auth-icon ' + authCls + '" '
-    + 'onclick="openAuthModal(\'' + esc(p.ip) + '\',\'' + esc(p.fabricante||'') + '\',' + authOkNum + ',\'' + esc(p.auth_user||'') + '\')" '
-    + 'title="' + authTip + '">&#128273;</span>';
+    ? '\u2713 Web auth OK: ' + esc(p.auth_user || '') + (IS_ADMIN ? ' \u2014 clique para reconfigurar' : '')
+    : (p.auth_ok === false ? '\u2717 Falha no login web' + (IS_ADMIN ? ' \u2014 clique para configurar' : '') : 'Login web n\u00e3o tentado' + (IS_ADMIN ? ' \u2014 clique para configurar' : ''));
+  var authIcon = IS_ADMIN
+    ? '<span class="auth-icon ' + authCls + '" '
+      + 'onclick="openAuthModal(\'' + esc(p.ip) + '\',\'' + esc(p.fabricante||'') + '\',' + authOkNum + ',\'' + esc(p.auth_user||'') + '\')" '
+      + 'title="' + authTip + '">&#128273;</span>'
+    : '<span class="auth-icon ' + authCls + '" title="' + authTip + '">&#128273;</span>';
 
   return '<tr data-ip="' + esc(p.ip) + '" data-fab="' + esc(p.fabricante||'') + '" ' +
          'data-tipo="' + esc(p.tipo||'') + '" ' +
@@ -708,6 +743,7 @@ function toggleDnsPanel() {
 }
 
 function applyDnsAction() {
+  if (!IS_ADMIN) { alert('Acesso restrito. Faça login no painel admin.'); return; }
   var dns1 = (document.getElementById('target-dns1').value || '').trim();
   var dns2 = (document.getElementById('target-dns2').value || '').trim();
   if (!dns1) { alert('Informe o DNS Primário Alvo.'); return; }
@@ -818,6 +854,7 @@ function exportCSV() {
 
 // ---- Credentials Modal ---------------------------------------------------
 function openAuthModal(ip, fab, authOk, authUser) {
+  if (!IS_ADMIN) return; // Somente admins podem configurar credenciais
   document.getElementById('cred-ip').value   = ip;
   document.getElementById('cred-fab').value  = fab;
   document.getElementById('cred-user').value = '';
@@ -842,6 +879,7 @@ function closeAuthModal() {
 }
 
 function submitCredentials() {
+  if (!IS_ADMIN) { alert('Acesso restrito. Faça login no painel admin.'); return; }
   var ip   = document.getElementById('cred-ip').value;
   var user = document.getElementById('cred-user').value.trim();
   var pass = document.getElementById('cred-pass').value;
