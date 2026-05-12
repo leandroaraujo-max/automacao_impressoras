@@ -192,6 +192,7 @@ Antes de executar o scanner pela primeira vez, confirme que os seguintes arquivo
 | `printer_credentials.json` | Não (gerado automaticamente) | Credenciais manuais por IP |
 
 > **`admin.key`** é criado automaticamente na primeira execução com a senha padrão `admin`. **Troque o conteúdo do arquivo para uma senha segura antes de disponibilizar o servidor em rede.**
+> O arquivo está no `.gitignore` (`*.key`) e **nunca será versionado automaticamente** — mantenha-o apenas local.
 
 ---
 
@@ -233,21 +234,36 @@ nmap -sU -p 161 10.70.82.10
 Impressoras/
 ├── scan_printers.py                     # Backend principal — scanner + API Flask
 ├── config.py                            # Configuração centralizada — carrega .env
-├── .env                                 # Variáveis de ambiente locais (não versionado)
+├── .env                                 # Variáveis de ambiente locais (NÃO versionado — .gitignore)
 ├── .env.example                         # Template de configuração (versionado)
-├── admin.key                            # Senha do painel admin (texto simples; criado automaticamente)
-├── automacao.log                        # Log rotativo gerado em runtime (não versionado)
-├── cache.json                           # Cache incremental (gerado automaticamente)
-├── inventory.html                       # Inventário HTML gerado (gerado automaticamente)
-├── printer_credentials.json             # Credenciais manuais por IP (gerado automaticamente)
+├── .gitignore                           # Regras de exclusão do Git
+├── admin.key                            # Senha do painel admin (NÃO versionado — .gitignore *.key)
+├── automacao.log                        # Log rotativo gerado em runtime (NÃO versionado — .gitignore)
+├── cache.json                           # Cache incremental (NÃO versionado — .gitignore)
+├── inventory.html                       # Inventário HTML gerado (NÃO versionado — .gitignore)
+├── printer_credentials.json             # Credenciais manuais por IP (NÃO versionado — .gitignore)
 ├── Templates/
 │   ├── inventory_template.html          # Template com $DATA, $IS_ADMIN → inventory.html
 │   └── probe.html                       # Diagnóstico de conectividade individual
 └── Redes Imps CDS/
     ├── Atualizar-Redes.ps1              # Script PowerShell de atualização do CSV de endereçamento
     ├── Endereçamento de Rede CDS - Rede CDS.csv   # Planilha fonte (editada manualmente)
-    └── Endereçamento_Atualizado.csv     # Lida pelo scanner (colunas: CD, Range 01..16)
+    └── Endereçamento_Atualizado.csv     # Lida pelo scanner (NÃO versionado — .gitignore *.csv)
 ```
+
+### O que o `.gitignore` protege
+
+| Padrão | O que cobre | Motivo |
+|--------|-------------|--------|
+| `*.key` | `admin.key` e qualquer outro arquivo `.key` | Contém senhas em texto simples |
+| `.env` | Configuração local com senhas reais | Evitar exposição de credenciais |
+| `cache.json` | Cache de impressoras descobertas | Dado operacional, não código |
+| `inventory.html` | HTML gerado a partir do cache | Gerado automaticamente |
+| `printer_credentials.json` | Credenciais por IP salvas manualmente | Contém senhas |
+| `automacao.log` / `automacao.log.*` | Logs rotativos de runtime | Dado operacional |
+| `*.csv` | Planilhas de endereçamento de rede | Informação sensível de infraestrutura |
+| `__pycache__/` `*.pyc` | Bytecode Python compilado | Gerado automaticamente |
+| `*.bat` `*.txt` | Scripts e notas locais | Operacional/pessoal |
 
 ---
 
