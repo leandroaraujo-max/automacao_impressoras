@@ -758,6 +758,99 @@ def _http_post_authenticated(ip: str, path: str, payload: str,
         return None
 
 
+def _samsung_syncthru_set_dns(ip: str, user: str, password: str,
+                               dns1: str, dns2: str,
+                               use_https: bool = False) -> bool:
+    """Login no Samsung SyncThru via cookie de sessão e aplica DNS.
+
+    O SyncThru ML/SL series usa autenticação baseada em sessão (cookie), não
+    HTTP Basic. O fluxo é:
+      1. POST /sws/security/login.json  → obtém cookie de sessão
+      2. PUT/POST /sws/swsapi/swsconfig?subtype=networkSetting  → aplica DNS
+
+    Retorna True se o DNS foi aplicado com sucesso.
+    """
+    import http.cookiejar, json as _json, ssl, urllib.request, urllib.parse
+
+    scheme = 'https' if use_https else 'http'
+    jar    = http.cookiejar.CookieJar()
+    ctx    = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode    = ssl.CERT_NONE
+    if use_https:
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(jar),
+            urllib.request.HTTPSHandler(context=ctx),
+        )
+    else:
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(jar),
+        )
+
+    # --- Passo 1: Login ---
+    login_url = f'{scheme}://{ip}/sws/security/login.json'
+    # Tenta JSON e depois form-encoded (firmwares mais antigos usam form)
+    login_attempts = [
+        (_json.dumps({"login": {"id": user, "passwd": password,
+                                "idleTimeout": "60"}}).encode(),
+         'application/json'),
+        (urllib.parse.urlencode({"login[id]": user,
+                                 "login[passwd]": password}).encode(),
+         'application/x-www-form-urlencoded'),
+    ]
+    login_ok = False
+    for body, ctype in login_attempts:
+        try:
+            req = urllib.request.Request(
+                login_url, data=body,
+                headers={'Content-Type': ctype, 'User-Agent': 'PrinterScanner/1.0'},
+                method='POST',
+            )
+            with opener.open(req, timeout=HTTP_TIMEOUT) as r:
+                resp = r.read(512).decode('utf-8', errors='ignore')
+            # Considera login OK se: algum cookie foi setado OU resposta indica sucesso
+            has_cookie = any(True for _ in jar)
+            resp_ok    = ('"status"' in resp and ('": 1' in resp or '":1' in resp
+                                                   or ': true' in resp.lower()))
+            if has_cookie or resp_ok:
+                login_ok = True
+                log.debug(f'[samsung_login] {ip} login OK user={user!r} ctype={ctype}')
+                break
+        except Exception as e:
+            log.debug(f'[samsung_login] {ip} login erro ({ctype}): {e}')
+
+    if not login_ok:
+        log.debug(f'[samsung_login] {ip} login falhou user={user!r} https={use_https}')
+        return False
+
+    # --- Passo 2: Aplica DNS ---
+    dns_payload = _json.dumps({
+        'networkSetting': {
+            'tcpip': {'dns': {'primaryDns': dns1, 'secondaryDns': dns2}}
+        }
+    }).encode()
+    for method, path in (
+        ('PUT',  f'{scheme}://{ip}/sws/swsapi/swsconfig?subtype=networkSetting'),
+        ('POST', f'{scheme}://{ip}/sws/swsapi/swsconfig?subtype=networkSetting'),
+        ('POST', f'{scheme}://{ip}/sws/app/information/network/networkSetting'),
+    ):
+        try:
+            req = urllib.request.Request(
+                path, data=dns_payload,
+                headers={'Content-Type': 'application/json',
+                         'User-Agent': 'PrinterScanner/1.0'},
+                method=method,
+            )
+            with opener.open(req, timeout=HTTP_TIMEOUT) as r:
+                resp = r.read(1024).decode('utf-8', errors='ignore')
+            if any(x in resp.lower() for x in ('ok', 'success', 'true', '"status"')):
+                log.info(f'[samsung_dns] {ip} {method} ok: {dns1}/{dns2} user={user!r}')
+                return True
+        except Exception as e:
+            log.debug(f'[samsung_dns] {ip} {method} {path} erro: {e}')
+    return False
+
+
 def apply_dns_config(ip: str, manufacturer: str,
                      dns1: str, dns2: str) -> dict:
     """Aplica DNS primário e secundário no equipamento.
@@ -846,23 +939,28 @@ def apply_dns_config(ip: str, manufacturer: str,
             }
         }
         payload_json = _json.dumps(payload_dict)
-        for password in SAMSUNG_PASSWORDS:
-            # SyncThru aceita JSON via PUT ou POST dependendo do firmware
-            for method_path in (
-                '/sws/swsapi/swsconfig?subtype=networkSetting',
-                '/sws/app/information/network/networkSetting',
-            ):
-                resp = _http_post_authenticated(
-                    ip, method_path, payload_json,
-                    SAMSUNG_USER, password,
-                    content_type='application/json')
-                if resp is not None and ('ok' in resp.lower() or 'success' in resp.lower()
-                                         or 'true' in resp.lower()):
-                    result = {'ok': True, 'method': 'SyncThru HTTP POST',
-                              'detail': f'DNS1={dns1} DNS2={dns2} senha={password[:3]}***'}
+
+        # Credenciais salvas para este IP têm prioridade
+        _saved = load_printer_credentials().get(ip, {})
+        _candidates: list = []
+        if _saved.get('password'):
+            _candidates.append((_saved.get('user', SAMSUNG_USER), _saved['password']))
+        for pw in SAMSUNG_PASSWORDS:
+            entry = (SAMSUNG_USER, pw)
+            if entry not in _candidates:
+                _candidates.append(entry)
+
+        for use_https in (False, True):
+            for user, password in _candidates:
+                # Usa auth por sessão (cookie) — correto para SyncThru ML/SL series
+                if _samsung_syncthru_set_dns(ip, user, password, dns1, dns2,
+                                             use_https=use_https):
+                    result = {'ok': True,
+                              'method': f'SyncThru {"HTTPS" if use_https else "HTTP"} (sessão)',
+                              'detail': f'DNS1={dns1} DNS2={dns2} user={user}'}
                     log.info(f'[apply_dns] {ip} Samsung SyncThru ok: {dns1}/{dns2}')
                     return result
-        result['detail'] = ('SyncThru sem confirmação — verifique se o payload '  
+        result['detail'] = ('SyncThru sem confirmação — verifique se o payload '
                             'foi aceito manualmente em http://' + ip + '/sws')
 
     else:

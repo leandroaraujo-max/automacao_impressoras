@@ -353,7 +353,11 @@ td.td-dns-bad { background: rgba(239,68,68,.1); }
 'use strict';
 const ALL_PRINTERS = $DATA;
 const ALL_CDS      = $CDS;
-const PROBE_BASE   = 'http://127.0.0.1:$PROBE_PORT';
+// Se a página for servida pelo Flask (http/https), usa a mesma origem para evitar CORS.
+// Se aberta como file://, usa o endereço hardcoded do servidor local.
+const PROBE_BASE   = (window.location.protocol === 'file:')
+    ? 'http://127.0.0.1:$PROBE_PORT'
+    : window.location.origin;
 
 // Índice por CD
 var BY_CD = {};
