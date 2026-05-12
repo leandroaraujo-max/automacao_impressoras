@@ -1428,18 +1428,15 @@ def get_page_count(ip: str) -> Optional[str]:
 def get_zebra_odometer(ip: str) -> Optional[str]:
     """Odômetro da cabeça térmica Zebra em polegadas.
 
-    Cascata Fail-Fast (ordem de velocidade/resiliência a firewall):
-    1. SNMP UDP 161 — OID Eltron (polegadas, modelos GK/LP/legado). UDP não é
-       bloqueado por firewalls de porta normalmente e responde em <2 s.
-    2. SNMP UDP 161 — OID ZebraNet dot count ÷ DPI (firmwares ZT/ZD SNMP).
-    3. SGD TCP 9100 — odometer.total_print_length (ZT/ZD firmware moderno).
-       Bloqueado em alguns ambientes; timeout 3 s, silencia exceções.
-    4. HTTP TCP 80  — /server/SYSINFO.htm  (regex Head Mileage/Odometer).
-    5. HTTP TCP 80  — /server/CFGPAGE.htm  (mesmo regex).
+    Cascata exclusivamente SNMP/HTTP (porta 9100 bloqueada por firewall nos CDs):
+    1. SNMP UDP 161 — OID Eltron (polegadas direto, modelos GK/LP/legado).
+    2. SNMP UDP 161 — OID ZebraNet dot count ÷ DPI (firmware ZT/ZD SNMP).
+    3. HTTP TCP 80  — /server/SYSINFO.htm  (regex Head Mileage/Odometer).
+    4. HTTP TCP 80  — /server/CFGPAGE.htm  (mesmo regex).
     """
     import re
 
-    # --- 1. SNMP Eltron (UDP — mais rápido, menor risco de firewall) ---
+    # --- 1. SNMP Eltron (UDP — mais rápido, sem risco de firewall TCP) ---
     val = _snmp_get(ip, OID_ZEBRA_ODOM_ELTRON)
     if val and val.lstrip('-').isdigit():
         inches = int(val)
@@ -1453,19 +1450,7 @@ def get_zebra_odometer(ip: str) -> Optional[str]:
         if dots > 0:
             return f'{dots // ZEBRA_DEFAULT_DPI:,} pol.'
 
-    # --- 3. SGD nativo TCP 9100 (timeout 3 s; silencia firewall-drop) ---
-    sgd_raw = _zebra_sgd(ip, '! U1 getvar "odometer.total_print_length"')
-    if sgd_raw:
-        sgd_clean = sgd_raw.strip().lstrip('"').rstrip('"').replace(',', '')
-        if sgd_clean.lstrip('-').isdigit():
-            val_int = int(sgd_clean)
-            if val_int > 0:
-                # Heurística: valor > 50 000 → provável dots; caso contrário polegadas
-                inches = val_int // ZEBRA_DEFAULT_DPI if val_int > 50_000 else val_int
-                if 0 < inches < 5_000_000:
-                    return f'{inches:,} pol.'
-
-    # --- 4-5. HTTP scraping TCP 80 (fallback final) ---
+    # --- 3-4. HTTP scraping TCP 80 (fallback; sem porta 9100) ---
     for path in ('/server/SYSINFO.htm', '/server/CFGPAGE.htm'):
         body = _http_get_page(ip, path)
         if not body:
@@ -1489,45 +1474,14 @@ def get_zebra_odometer(ip: str) -> Optional[str]:
 
 
 def _zebra_sgd(ip: str, command: str, timeout: float = 3.0) -> Optional[str]:
-    """Envia um comando SGD para a Zebra via socket TCP porta 9100.
+    """Stub inativo: porta 9100 bloqueada por firewall nos CDs.
 
-    Comandos típicos:
-      getvar: '! U1 getvar "internal_wired.ip.dns1"'
-      setvar: '! U1 setvar "internal_wired.ip.dns1" "172.30.2.13"'
-      odom:   '! U1 getvar "odometer.total_print_length"'
-
-    Retorna a resposta como string (sem aspas externas) ou None em caso de erro.
+    Mantido para compatibilidade de assinatura. Retorna sempre None.
+    Se o ambiente mudar, remova este stub e restaure a implementação
+    com socket TCP porta 9100.
     """
-    import socket as _sock
-    try:
-        s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
-        s.settimeout(timeout)
-        try:
-            s.connect((ip, 9100))
-            s.sendall((command + '\r\n').encode('ascii', errors='replace'))
-            # Lê até 256 bytes ou timeout
-            buf = b''
-            try:
-                while len(buf) < 256:
-                    chunk = s.recv(256 - len(buf))
-                    if not chunk:
-                        break
-                    buf += chunk
-            except _sock.timeout:
-                pass
-        finally:
-            s.close()
-        if not buf:
-            return None
-        text = buf.decode('ascii', errors='ignore').strip()
-        # Remove aspas externas que a Zebra inclui na resposta de getvar
-        if text.startswith('"') and text.endswith('"'):
-            text = text[1:-1]
-        log.debug(f'[zebra_sgd] {ip} cmd={command!r} -> {text!r}')
-        return text or None
-    except Exception as e:
-        log.debug(f'[zebra_sgd] {ip} erro: {e}')
-        return None
+    log.debug(f'[zebra_sgd] {ip} porta 9100 desativada (firewall); cmd ignorado')
+    return None
 
 
 def _decode_html(s: str) -> str:
@@ -2918,6 +2872,28 @@ def main() -> None:
             target=_scan_and_open, args=(update_only,),
             daemon=True, name='scan-master'
         ).start()
+
+    # --- Background scheduler: atualiza métricas a cada 60 minutos ---
+    _SCHEDULER_INTERVAL_S = 3600  # 60 min
+
+    def _bg_scheduler() -> None:
+        """Loop daemon que dispara run_full_scan(update_only=True) periodicamente."""
+        log.info(f'[scheduler] Iniciado. Intervalo: {_SCHEDULER_INTERVAL_S // 60} min.')
+        while True:
+            time.sleep(_SCHEDULER_INTERVAL_S)
+            log.info('[scheduler] Iniciando atualizacao de metricas (update_only=True)...')
+            try:
+                run_full_scan(update_only=True)
+                log.info('[scheduler] Atualizacao concluida.')
+            except Exception as _exc:
+                log.warning(f'[scheduler] Falha na atualizacao: {_exc}')
+
+    threading.Thread(
+        target=_bg_scheduler,
+        daemon=True,
+        name='bg-scheduler',
+    ).start()
+    log.info('[scheduler] Thread bg-scheduler registrada.')
 
     # Importa Flask lazy — só aqui, após o scan já estar rodando em background
     flask_app = _get_flask_app()
