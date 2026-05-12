@@ -31,9 +31,18 @@ import re
 import socket
 import threading
 import time
+import ssl
 import urllib.error
 import urllib.request
 import webbrowser
+
+# Contexto SSL global — desabilita verificação de certificado.
+# Impressoras usam certificados autoassinados embutidos no firmware;
+# não há CA confiável para esses dispositivos em rede interna.
+# Aplica em TODOS os urlopen (inclusive redirects HTTP→HTTPS invisíveis).
+_SSL_CTX = ssl.create_default_context()
+_SSL_CTX.check_hostname = False
+_SSL_CTX.verify_mode = ssl.CERT_NONE
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -483,22 +492,14 @@ def _http_get_page(ip: str, path: str, use_https: bool = False,
     Retentar até 3 vezes com backoff exponencial em caso de falha de rede.
     Erros 4xx (recurso não existe) não são retriados.
     """
-    import ssl, urllib.error
     scheme = 'https' if use_https else 'http'
     url = f'{scheme}://{ip}{path}'
 
     def _attempt() -> Optional[str]:
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'PrinterScanner/1.0'})
-            if use_https:
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-                with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-                    return resp.read(65536).decode('utf-8', errors='ignore')
-            else:
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    return resp.read(65536).decode('utf-8', errors='ignore')
+            with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX) as resp:
+                return resp.read(65536).decode('utf-8', errors='ignore')
         except urllib.error.HTTPError as e:
             if 400 <= e.code < 500:
                 return None   # 4xx: não adianta retentar
@@ -712,7 +713,7 @@ def get_network_config(ip: str, manufacturer: str) -> dict:
 def _http_get_authenticated(ip: str, path: str, user: str, password: str,
                             use_https: bool = False) -> Optional[str]:
     """GET HTTP com autenticação Basic Auth."""
-    import base64, ssl
+    import base64
     scheme = 'https' if use_https else 'http'
     url = f'{scheme}://{ip}{path}'
     creds = base64.b64encode(f'{user}:{password}'.encode()).decode()
@@ -724,15 +725,8 @@ def _http_get_authenticated(ip: str, path: str, user: str, password: str,
                 'User-Agent': 'PrinterScanner/1.0',
             },
         )
-        if use_https:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=ctx) as r:
-                return r.read(65536).decode('utf-8', errors='ignore')
-        else:
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
-                return r.read(65536).decode('utf-8', errors='ignore')
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=_SSL_CTX) as r:
+            return r.read(65536).decode('utf-8', errors='ignore')
     except Exception as e:
         log.debug(f'[http_get_auth] {ip}{path} erro: {e}')
         return None
@@ -827,7 +821,7 @@ def _http_post_authenticated(ip: str, path: str, payload: str,
     Retentar até 3 vezes com backoff exponencial em caso de falha de rede.
     Erros 4xx não são retriados (credencial inválida, recurso inexistente).
     """
-    import base64, ssl, urllib.error
+    import base64
     scheme = 'https' if use_https else 'http'
     url = f'{scheme}://{ip}{path}'
     creds = base64.b64encode(f'{user}:{password}'.encode()).decode()
@@ -844,15 +838,8 @@ def _http_post_authenticated(ip: str, path: str, payload: str,
                 },
                 method='POST',
             )
-            if use_https:
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-                with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=ctx) as r:
-                    return r.read(4096).decode('utf-8', errors='ignore')
-            else:
-                with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
-                    return r.read(4096).decode('utf-8', errors='ignore')
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=_SSL_CTX) as r:
+                return r.read(4096).decode('utf-8', errors='ignore')
         except urllib.error.HTTPError as e:
             if 400 <= e.code < 500:
                 return None   # 4xx: não adianta retentar
@@ -876,22 +863,15 @@ def _samsung_syncthru_set_dns(ip: str, user: str, password: str,
 
     Retorna True se o DNS foi aplicado com sucesso.
     """
-    import http.cookiejar, json as _json, ssl, urllib.request, urllib.parse
+    import http.cookiejar, json as _json, urllib.parse
 
     scheme = 'https' if use_https else 'http'
     jar    = http.cookiejar.CookieJar()
-    ctx    = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode    = ssl.CERT_NONE
-    if use_https:
-        opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(jar),
-            urllib.request.HTTPSHandler(context=ctx),
-        )
-    else:
-        opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(jar),
-        )
+    # Sempre inclui HTTPSHandler com _SSL_CTX para cobrir redirects HTTP→HTTPS
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(jar),
+        urllib.request.HTTPSHandler(context=_SSL_CTX),
+    )
 
     # --- Passo 1: Login ---
     login_url = f'{scheme}://{ip}/sws/security/login.json'
@@ -1644,7 +1624,7 @@ def _probe_http(ip: str) -> dict:
     try:
         req = urllib.request.Request(
             f'http://{ip}/', headers={'User-Agent': 'PrinterProbe/1.0'})
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=_SSL_CTX) as resp:
             out['ms']           = round((time.monotonic() - t0) * 1000)
             out['status']       = resp.status
             out['server']       = resp.headers.get('Server', '')
