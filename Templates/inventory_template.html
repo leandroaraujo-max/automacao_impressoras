@@ -330,9 +330,10 @@ td.td-dns-bad { background: rgba(239,68,68,.1); }
       <label>DNS Status</label>
       <select id="f-dns" class="filter-select" onchange="applyFilters()">
         <option value="">Todos</option>
-        <option value="set">Com IP configurado</option>
+        <option value="set">SET</option>
         <option value="notset">NOT SET</option>
         <option value="none">N&atilde;o coletado</option>
+        <option value="bad">Incorreto (&ne; alvo)</option>
       </select>
     </div>
     <button class="btn-clear" onclick="clearFilters()">&#10005; Limpar</button>
@@ -703,7 +704,17 @@ function applyFilters() {
     if (fTipo   && tr.dataset.tipo !== fTipo)                                  show = false;
     if (fSerial && tr.dataset.serial.indexOf(fSerial) === -1
                 && tr.dataset.modelo.indexOf(fSerial) === -1)                  show = false;
-    if (fDns    && tr.dataset.dnsStatus !== fDns)                              show = false;
+    if (fDns === 'bad') {
+      // incorreto = tem IP mas ≠ alvo (só aplica quando alvo está preenchido)
+      var d1 = tr.dataset.dns1 || '';
+      var d2 = tr.dataset.dns2 || '';
+      var dSt = tr.dataset.dnsStatus;
+      var isBad = dSt === 'set' && (
+        (targetDns1 && d1 !== targetDns1) ||
+        (targetDns2 && d2 !== targetDns2)
+      );
+      if (!isBad) show = false;
+    } else if (fDns && tr.dataset.dnsStatus !== fDns) show = false;
     if (fDnsOnly && targetDns1) {
       var d1ok = (tr.dataset.dns1 || '') === targetDns1;
       var d2ok = !targetDns2 || (tr.dataset.dns2 || '') === targetDns2;
