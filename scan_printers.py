@@ -2329,6 +2329,37 @@ def _register_routes(flask_app, req, jsonify_fn, render_tmpl):
             'netcfg':    {k: v for k, v in netcfg.items() if k not in ('auth_ok', 'auth_user')},
         })
 
+    @flask_app.route('/api/scan/start', methods=['POST'])
+    def api_scan_start():
+        """[ADMIN] Inicia um novo scan completo ou atualização incremental em background."""
+        err = _require_admin()
+        if err: return err
+
+        if _scan_status.get('running'):
+            return jsonify_fn({'error': 'Scan já está em andamento'}), 409
+
+        import json as _json
+        try:
+            body = _json.loads(req.get_data(as_text=True) or '{}')
+        except Exception:
+            body = {}
+
+        update_only = bool(body.get('update_only', False))
+        mode = 'update' if update_only else 'full'
+
+        def _bg_scan():
+            try:
+                printers = run_full_scan(update_only=update_only)
+                generate_inventory_html(printers, INVENTORY_PATH, is_admin=False)
+                log.info(f'[scan/start] Scan {mode} concluído — {len(printers)} impressoras')
+            except Exception as exc:
+                log.error(f'[scan/start] Erro no scan {mode}: {exc}', exc_info=True)
+
+        threading.Thread(target=_bg_scan, daemon=True,
+                         name=f'scan-api-{mode}').start()
+
+        return jsonify_fn({'started': True, 'mode': mode})
+
     @flask_app.route('/api/apply-dns', methods=['POST'])
     def api_apply_dns():
         """[ADMIN] Aplica DNS em uma ou mais impressoras."""

@@ -198,6 +198,18 @@ td.td-dns-bad { background: rgba(239,68,68,.1); }
 .btn-export { background:#0f2a1a; border:1px solid #1a5c30; color:#4ade80; padding:6px 14px;
   border-radius:7px; font-size:.78rem; font-weight:600; cursor:pointer; white-space:nowrap; }
 .btn-export:hover { opacity:.85; }
+/* ---- Scan panel ---- */
+.scan-panel { background:#13161f; border:1px solid #2d3148; border-radius:12px; margin-bottom:16px;
+  display:flex; align-items:center; gap:12px; padding:10px 16px; flex-wrap:wrap; }
+.btn-scan { background:#1a2a1a; border:1px solid #22c55e; color:#4ade80;
+  padding:7px 16px; border-radius:7px; font-size:.82rem; font-weight:700;
+  cursor:pointer; transition:opacity .15s; white-space:nowrap; }
+.btn-scan:hover { opacity:.8; }
+.btn-scan:disabled { opacity:.35; cursor:not-allowed; }
+.scan-progress { font-size:.75rem; color:#94a3b8; flex:1; min-width:150px; }
+.scan-progress b { color:#f1f5f9; }
+.scan-bar-wrap { height:4px; background:#1e2233; border-radius:4px; width:100%; margin-top:4px; }
+.scan-bar { height:4px; background:#22c55e; border-radius:4px; transition:width .4s; width:0; }
 /* ---- Credentials modal ---- */
 .modal-overlay { position:fixed; inset:0; background:rgba(0,0,0,.78); z-index:999;
   display:flex; align-items:center; justify-content:center; }
@@ -325,6 +337,16 @@ td.td-dns-bad { background: rgba(239,68,68,.1); }
     <span class="visible-count" id="visible-count"></span>
   </div>
 
+  <!-- ---- Scan panel — somente admin ---- -->
+  <div class="scan-panel" id="scan-panel" style="display:none">
+    <button id="btn-scan-full"   class="btn-scan" onclick="startScan(false)">&#128257; Novo Scan Completo</button>
+    <button id="btn-scan-update" class="btn-scan" onclick="startScan(true)"  style="background:#1a1a2a;border-color:#818cf8;color:#a5b4fc;">&#8635; Atualizar Cache</button>
+    <div class="scan-progress" id="scan-progress-info" style="display:none">
+      <span id="scan-progress-text"><b>Scan em andamento…</b></span>
+      <div class="scan-bar-wrap"><div class="scan-bar" id="scan-bar"></div></div>
+    </div>
+  </div>
+
   <!-- ---- DNS Config panel — somente admin ---- -->
   <div class="dns-panel" id="dns-panel" style="display:none">
     <div class="dns-panel-hdr" onclick="toggleDnsPanel()">
@@ -390,6 +412,9 @@ const IS_ADMIN     = ($IS_ADMIN === true || '$IS_ADMIN' === 'true');
   // Painel DNS: apenas admin
   var dnsPanel = document.getElementById('dns-panel');
   if (dnsPanel) dnsPanel.style.display = IS_ADMIN ? '' : 'none';
+  // Painel Scan: apenas admin
+  var scanPanel = document.getElementById('scan-panel');
+  if (scanPanel) scanPanel.style.display = IS_ADMIN ? '' : 'none';
 })();
 
 // Índice por CD
@@ -741,6 +766,80 @@ function toggleDnsPanel() {
     body.style.display = 'none'; arrow.innerHTML = '&#9660;';
   }
 }
+
+// ---- Scan forçado --------------------------------------------------------
+var _scanPollTimer = null;
+
+function startScan(updateOnly) {
+  if (!IS_ADMIN) return;
+  var label = updateOnly ? 'Atualizar Cache' : 'Novo Scan Completo';
+  if (!confirm('Confirmar: ' + label + '?\nIsso pode levar vários minutos.')) return;
+
+  fetch(PROBE_BASE + '/api/scan/start', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({update_only: !!updateOnly}),
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(d) {
+    if (d.error) { alert('Erro: ' + d.error); return; }
+    _setScanRunning(true);
+    _pollScanStatus();
+  })
+  .catch(function(e) { alert('Erro ao iniciar scan: ' + e); });
+}
+
+function _setScanRunning(running) {
+  var btnFull   = document.getElementById('btn-scan-full');
+  var btnUpdate = document.getElementById('btn-scan-update');
+  var info      = document.getElementById('scan-progress-info');
+  if (btnFull)   btnFull.disabled   = running;
+  if (btnUpdate) btnUpdate.disabled = running;
+  if (info)      info.style.display = running ? '' : 'none';
+  if (!running) {
+    document.getElementById('scan-bar').style.width = '0';
+    if (_scanPollTimer) { clearTimeout(_scanPollTimer); _scanPollTimer = null; }
+  }
+}
+
+function _pollScanStatus() {
+  fetch(PROBE_BASE + '/api/status')
+  .then(function(r) { return r.json(); })
+  .then(function(s) {
+    var txt  = document.getElementById('scan-progress-text');
+    var bar  = document.getElementById('scan-bar');
+    if (s.running) {
+      var pct = s.networks_total > 0
+        ? Math.round(100 * s.networks_done / s.networks_total)
+        : (s.total > 0 ? Math.min(90, Math.round(100 * s.networks_done / Math.max(1, s.total) * 5)) : 10);
+      if (bar) bar.style.width = Math.max(5, pct) + '%';
+      if (txt) txt.innerHTML = '<b>Scan em andamento…</b> '
+        + (s.networks_total > 0
+            ? s.networks_done + '/' + s.networks_total + ' redes'
+            : s.total + ' impressoras atualizadas');
+      _scanPollTimer = setTimeout(_pollScanStatus, 2000);
+    } else {
+      if (bar) bar.style.width = '100%';
+      if (txt) txt.innerHTML = '<b style="color:#4ade80">&#10003; Scan concluído!</b> '
+        + s.total + ' impressoras — recarregando…';
+      setTimeout(function() { window.location.reload(); }, 1500);
+    }
+  })
+  .catch(function() {
+    _scanPollTimer = setTimeout(_pollScanStatus, 3000);
+  });
+}
+
+// Verifica ao carregar se já há scan em andamento (ex: servidor reiniciado mid-scan)
+(function _checkScanOnLoad() {
+  if (!IS_ADMIN) return;
+  fetch(PROBE_BASE + '/api/status')
+  .then(function(r) { return r.json(); })
+  .then(function(s) {
+    if (s.running) { _setScanRunning(true); _pollScanStatus(); }
+  })
+  .catch(function() {});
+})();
 
 function applyDnsAction() {
   if (!IS_ADMIN) { alert('Acesso restrito. Faça login no painel admin.'); return; }
