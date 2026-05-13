@@ -114,7 +114,7 @@ try:
         HP_EWS_USERS, HP_EWS_PASSWORDS, HP_EWS_USER, HP_EWS_PASSWORD,
         SAMSUNG_USER, SAMSUNG_PASSWORDS,
         ZEBRA_USER, ZEBRA_PASSWORDS,
-        AD_SERVER, AD_DOMAIN, AD_BASE_DN, AD_ADMIN_GROUP, AD_USE_SSL, AD_TIMEOUT,
+        AD_DOMAIN, AD_BASE_DN, AD_ADMIN_GROUP, AD_USE_SSL, AD_TIMEOUT,
     )
 except ImportError:
     # Fallback se config.py não estiver disponível
@@ -131,7 +131,6 @@ except ImportError:
     SAMSUNG_PASSWORDS = ['sec00000', '1111', 'simpress1934@', '12345678', '3737', '']
     ZEBRA_USER        = 'admin'
     ZEBRA_PASSWORDS   = ['1234', '1934', '3737', '']
-    AD_SERVER      = ''
     AD_DOMAIN      = ''
     AD_BASE_DN     = ''
     AD_ADMIN_GROUP = ''
@@ -159,37 +158,77 @@ def _load_admin_password() -> str:
     return default
 
 
-def _check_ldap_auth(username: str, password: str) -> bool:
-    """Autentica via LDAP/AD.
+def _discover_ldap_servers():
+    """Descobre DCs do AD via DNS SRV _ldap._tcp.dc._msdcs.<AD_DOMAIN>.
 
-    - Faz bind com UPN (user@domain) ou sAMAccountName (domain\\user)
-    - Se AD_ADMIN_GROUP estiver definido, verifica memberOf
-    - Retorna False em qualquer falha de rede/config — o caller faz fallback
+    Ordem de tentativa:
+    1. DNS SRV (dnspython) — retorna todos os DCs em ordem de prioridade/peso
+    2. Fallback: domínio FQDN direto — Windows DNS resolve para um DC disponível
 
-    Requer: pip install ldap3  (já instalado)
+    Retorna lista de ldap3.Server para uso em ServerPool.
     """
-    if not AD_SERVER or not password:
+    from ldap3 import Server, Tls
+    import ssl as _ssl
+
+    tls  = Tls(validate=_ssl.CERT_NONE) if AD_USE_SSL else None
+    port = 636 if AD_USE_SSL else 389
+    domain = AD_DOMAIN
+    servers = []
+
+    # Tentativa 1: registros SRV via dnspython
+    try:
+        import dns.resolver
+        srv_qname = f'_ldap._tcp.dc._msdcs.{domain}'
+        answers = dns.resolver.resolve(srv_qname, 'SRV', lifetime=5.0)
+        for rdata in sorted(answers, key=lambda r: (r.priority, -r.weight)):
+            host = str(rdata.target).rstrip('.')
+            dc_port = int(rdata.port) if rdata.port else port
+            log.debug(f'[ldap] DC descoberto via SRV: {host}:{dc_port}')
+            servers.append(Server(host, port=dc_port, use_ssl=AD_USE_SSL,
+                                  tls=tls, connect_timeout=AD_TIMEOUT,
+                                  get_info=None))
+        if servers:
+            return servers
+    except Exception as _e:
+        log.debug(f'[ldap] DNS SRV falhou ({type(_e).__name__}): {_e}')
+
+    # Fallback: domínio FQDN — DNS resolve para DC disponível via round-robin
+    log.debug(f'[ldap] Fallback: conectando ao domínio {domain} diretamente')
+    servers.append(Server(domain, port=port, use_ssl=AD_USE_SSL,
+                          tls=tls, connect_timeout=AD_TIMEOUT, get_info=None))
+    return servers
+
+
+def _check_ldap_auth(username: str, password: str) -> bool:
+    """Autentica via LDAP/AD com descoberta automática de DCs.
+
+    - Descobre DCs via DNS SRV (automático, sem lista estática)
+    - Usa ldap3.ServerPool com ROUND_ROBIN + failover automático
+    - Faz bind com UPN (user@domain)
+    - Se AD_ADMIN_GROUP definido, verifica memberOf
+    - Retorna False em qualquer falha — o caller faz fallback para admin.key
+    """
+    if not AD_DOMAIN or not password:
         return False
     try:
-        from ldap3 import Server, Connection, ALL, NTLM, Tls
-        import ssl as _ssl
+        from ldap3 import ServerPool, Connection, ROUND_ROBIN, Tls
 
-        tls = Tls(validate=_ssl.CERT_NONE) if AD_USE_SSL else None
-        srv = Server(AD_SERVER, use_ssl=AD_USE_SSL, tls=tls,
-                     connect_timeout=AD_TIMEOUT, get_info=None)
+        servers = _discover_ldap_servers()
+        pool = ServerPool(servers, ROUND_ROBIN, active=True, exhaust=True)
 
-        # Monta bind DN: tenta UPN primeiro, cai em sAMAccountName
-        if AD_DOMAIN and '@' not in username and '\\' not in username:
+        # UPN: usuario@magazineluiza.intranet
+        if '@' not in username and '\\' not in username:
             bind_user = f'{username}@{AD_DOMAIN}'
         else:
             bind_user = username
 
-        conn = Connection(srv, user=bind_user, password=password,
+        conn = Connection(pool, user=bind_user, password=password,
                           auto_bind=True, receive_timeout=AD_TIMEOUT)
 
-        # Se grupo exigido, verifica memberOf via search
+        # Verifica grupo se configurado
         if AD_ADMIN_GROUP and AD_BASE_DN:
-            safe_user = username.replace('(', '').replace(')', '').replace('*', '').replace('\\', '')
+            safe_user = username.replace('(', '').replace(')', '') \
+                                .replace('*', '').replace('\\', '')
             conn.search(
                 AD_BASE_DN,
                 f'(&(objectClass=user)(sAMAccountName={safe_user})(memberOf={AD_ADMIN_GROUP}))',
@@ -211,20 +250,19 @@ def _check_admin_password(password: str, username: str = '') -> bool:
     """Autentica o usuário admin.
 
     Ordem de verificação:
-    1. Se AD_SERVER configurado E username fornecido → tenta LDAP/AD
+    1. Se AD_DOMAIN configurado E username fornecido → tenta LDAP/AD (DCs via DNS SRV)
     2. Fallback para admin.key local (senha fixa)
 
     O fallback garante acesso mesmo se o AD estiver indisponível.
     """
     import hmac
-    if AD_SERVER and username:
+    # Ativa autenticação AD se AD_DOMAIN configurado (AD_SERVER é opcional)
+    if AD_DOMAIN and username:
         ldap_ok = _check_ldap_auth(username, password)
         if ldap_ok:
             return True
-        # LDAP falhou (rede, credenciais erradas, fora do grupo)
-        # Se o AD respondeu mas negou acesso (senha errada), não faz fallback
-        # para não aceitar senha do AD que não serve pro admin.key e vice-versa.
-        # Só faz fallback se username == 'admin' (conta local de emergência).
+        # LDAP falhou (rede, credenciais erradas, fora do grupo).
+        # Fallback local apenas para username == 'admin' (conta de emergência).
         if username != 'admin':
             return False
 
@@ -2616,7 +2654,7 @@ def _register_routes(flask_app, req, jsonify_fn, render_tmpl):
             log.warning(f'[audit] LOGIN falhou — senha errada | user={uname!r} | ip={req.remote_addr}')
             error = '<div class="err">Usuário ou senha incorretos. Tente novamente.</div>'
         # Página de login inline (sem template externo)
-        ad_mode = bool(AD_SERVER)
+        ad_mode = bool(AD_DOMAIN)
         return FlaskResponse(
             _LOGIN_HTML
             .replace('{{ERROR_BLOCK}}', error)

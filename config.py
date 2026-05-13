@@ -70,11 +70,12 @@ ZEBRA_PASSWORDS: list[str] = [p for p in _zebra_pwd_raw.split(',')]
 # ---------------------------------------------------------------------------
 # Autenticação LDAP / Active Directory
 # ---------------------------------------------------------------------------
-# Para ativar, defina AD_SERVER no .env (ex: ldap://10.0.0.1 ou ldaps://dc.corp.local)
-# Deixe em branco para usar somente o admin.key local.
-AD_SERVER:      str = os.getenv('AD_SERVER', '')
-AD_DOMAIN:      str = os.getenv('AD_DOMAIN', '')          # ex: corp.local
-AD_BASE_DN:     str = os.getenv('AD_BASE_DN', '')          # ex: DC=corp,DC=local
-AD_ADMIN_GROUP: str = os.getenv('AD_ADMIN_GROUP', '')      # ex: CN=TI-Impressoras,OU=Grupos,DC=corp,DC=local
+# DCs descobertos automaticamente via DNS SRV:
+#   _ldap._tcp.dc._msdcs.<AD_DOMAIN>
+# Defina apenas AD_DOMAIN para ativar. AD_SERVER não é necessário.
+# Deixe AD_DOMAIN em branco para usar somente o admin.key local.
+AD_DOMAIN:      str = os.getenv('AD_DOMAIN', '')           # ex: magazineluiza.intranet
+AD_BASE_DN:     str = os.getenv('AD_BASE_DN', '')           # ex: DC=magazineluiza,DC=intranet
+AD_ADMIN_GROUP: str = os.getenv('AD_ADMIN_GROUP', '')       # ex: CN=TI-Impressoras,OU=Grupos,DC=magazineluiza,DC=intranet
 AD_USE_SSL:     bool = os.getenv('AD_USE_SSL', 'false').lower() in ('1', 'true', 'yes')
 AD_TIMEOUT:     int  = int(os.getenv('AD_TIMEOUT', '5'))
