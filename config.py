@@ -66,3 +66,15 @@ SAMSUNG_PASSWORDS: list[str] = [p for p in _samsung_pwd_raw.split(',')]
 ZEBRA_USER: str = os.getenv('ZEBRA_USER', 'admin')
 _zebra_pwd_raw: str = os.getenv('ZEBRA_PASSWORDS', '1234,1934,3737,')
 ZEBRA_PASSWORDS: list[str] = [p for p in _zebra_pwd_raw.split(',')]
+
+# ---------------------------------------------------------------------------
+# Autenticação LDAP / Active Directory
+# ---------------------------------------------------------------------------
+# Para ativar, defina AD_SERVER no .env (ex: ldap://10.0.0.1 ou ldaps://dc.corp.local)
+# Deixe em branco para usar somente o admin.key local.
+AD_SERVER:      str = os.getenv('AD_SERVER', '')
+AD_DOMAIN:      str = os.getenv('AD_DOMAIN', '')          # ex: corp.local
+AD_BASE_DN:     str = os.getenv('AD_BASE_DN', '')          # ex: DC=corp,DC=local
+AD_ADMIN_GROUP: str = os.getenv('AD_ADMIN_GROUP', '')      # ex: CN=TI-Impressoras,OU=Grupos,DC=corp,DC=local
+AD_USE_SSL:     bool = os.getenv('AD_USE_SSL', 'false').lower() in ('1', 'true', 'yes')
+AD_TIMEOUT:     int  = int(os.getenv('AD_TIMEOUT', '5'))

@@ -114,6 +114,7 @@ try:
         HP_EWS_USERS, HP_EWS_PASSWORDS, HP_EWS_USER, HP_EWS_PASSWORD,
         SAMSUNG_USER, SAMSUNG_PASSWORDS,
         ZEBRA_USER, ZEBRA_PASSWORDS,
+        AD_SERVER, AD_DOMAIN, AD_BASE_DN, AD_ADMIN_GROUP, AD_USE_SSL, AD_TIMEOUT,
     )
 except ImportError:
     # Fallback se config.py não estiver disponível
@@ -130,6 +131,12 @@ except ImportError:
     SAMSUNG_PASSWORDS = ['sec00000', '1111', 'simpress1934@', '12345678', '3737', '']
     ZEBRA_USER        = 'admin'
     ZEBRA_PASSWORDS   = ['1234', '1934', '3737', '']
+    AD_SERVER      = ''
+    AD_DOMAIN      = ''
+    AD_BASE_DN     = ''
+    AD_ADMIN_GROUP = ''
+    AD_USE_SSL     = False
+    AD_TIMEOUT     = 5
 
 NMAP_ARGS       = '-p 80,443,631,9100 --open -T4'
 
@@ -152,9 +159,76 @@ def _load_admin_password() -> str:
     return default
 
 
-def _check_admin_password(password: str) -> bool:
-    """Compara a senha fornecida com a do admin.key (timing-safe)."""
+def _check_ldap_auth(username: str, password: str) -> bool:
+    """Autentica via LDAP/AD.
+
+    - Faz bind com UPN (user@domain) ou sAMAccountName (domain\\user)
+    - Se AD_ADMIN_GROUP estiver definido, verifica memberOf
+    - Retorna False em qualquer falha de rede/config — o caller faz fallback
+
+    Requer: pip install ldap3  (já instalado)
+    """
+    if not AD_SERVER or not password:
+        return False
+    try:
+        from ldap3 import Server, Connection, ALL, NTLM, Tls
+        import ssl as _ssl
+
+        tls = Tls(validate=_ssl.CERT_NONE) if AD_USE_SSL else None
+        srv = Server(AD_SERVER, use_ssl=AD_USE_SSL, tls=tls,
+                     connect_timeout=AD_TIMEOUT, get_info=None)
+
+        # Monta bind DN: tenta UPN primeiro, cai em sAMAccountName
+        if AD_DOMAIN and '@' not in username and '\\' not in username:
+            bind_user = f'{username}@{AD_DOMAIN}'
+        else:
+            bind_user = username
+
+        conn = Connection(srv, user=bind_user, password=password,
+                          auto_bind=True, receive_timeout=AD_TIMEOUT)
+
+        # Se grupo exigido, verifica memberOf via search
+        if AD_ADMIN_GROUP and AD_BASE_DN:
+            safe_user = username.replace('(', '').replace(')', '').replace('*', '').replace('\\', '')
+            conn.search(
+                AD_BASE_DN,
+                f'(&(objectClass=user)(sAMAccountName={safe_user})(memberOf={AD_ADMIN_GROUP}))',
+                attributes=['sAMAccountName'],
+            )
+            in_group = len(conn.entries) > 0
+            conn.unbind()
+            return in_group
+
+        conn.unbind()
+        return True
+
+    except Exception as _exc:
+        log.debug(f'[ldap] Falha na autenticação LDAP para {username!r}: {_exc}')
+        return False
+
+
+def _check_admin_password(password: str, username: str = '') -> bool:
+    """Autentica o usuário admin.
+
+    Ordem de verificação:
+    1. Se AD_SERVER configurado E username fornecido → tenta LDAP/AD
+    2. Fallback para admin.key local (senha fixa)
+
+    O fallback garante acesso mesmo se o AD estiver indisponível.
+    """
     import hmac
+    if AD_SERVER and username:
+        ldap_ok = _check_ldap_auth(username, password)
+        if ldap_ok:
+            return True
+        # LDAP falhou (rede, credenciais erradas, fora do grupo)
+        # Se o AD respondeu mas negou acesso (senha errada), não faz fallback
+        # para não aceitar senha do AD que não serve pro admin.key e vice-versa.
+        # Só faz fallback se username == 'admin' (conta local de emergência).
+        if username != 'admin':
+            return False
+
+    # Autenticação local (admin.key)
     expected = _load_admin_password()
     return hmac.compare_digest(password.encode(), expected.encode())
 
@@ -2496,9 +2570,10 @@ input:focus{border-color:#3b82f6;box-shadow:0 0 0 3px rgba(59,130,246,.15);}
   <div class="divider"></div>
   {{ERROR_BLOCK}}
   <form method="POST" autocomplete="off" style="width:100%%;display:flex;flex-direction:column;gap:1.1rem;">
+    {{USERNAME_FIELD}}
     <div class="field">
       <label for="password">Senha de acesso</label>
-      <input type="password" id="password" name="password" autofocus required placeholder="••••••••">
+      <input type="password" id="password" name="password" {{AUTOFOCUS}} required placeholder="••••••••">
     </div>
     <button type="submit" class="btn">Entrar</button>
   </form>
@@ -2529,18 +2604,30 @@ def _register_routes(flask_app, req, jsonify_fn, render_tmpl):
     def login():
         error = ''
         if req.method == 'POST':
-            pw = req.form.get('password', '')
-            if _check_admin_password(pw):
+            uname = req.form.get('username', '').strip()
+            pw    = req.form.get('password', '')
+            if _check_admin_password(pw, username=uname):
+                display = uname or 'admin'
                 session['is_admin'] = True
-                session['username'] = 'admin'
-                log.info(f'[audit] LOGIN bem-sucedido | ip={req.remote_addr}')
+                session['username'] = display
+                log.info(f'[audit] LOGIN bem-sucedido | user={display} | ip={req.remote_addr}')
                 next_url = req.args.get('next', '/admin')
                 return redirect(next_url)
-            log.warning(f'[audit] LOGIN falhou — senha errada | ip={req.remote_addr}')
-            error = '<div class="err">Senha incorreta. Tente novamente.</div>'
+            log.warning(f'[audit] LOGIN falhou — senha errada | user={uname!r} | ip={req.remote_addr}')
+            error = '<div class="err">Usuário ou senha incorretos. Tente novamente.</div>'
         # Página de login inline (sem template externo)
-        return FlaskResponse(_LOGIN_HTML.replace('{{ERROR_BLOCK}}', error),
-                             mimetype='text/html; charset=utf-8')
+        ad_mode = bool(AD_SERVER)
+        return FlaskResponse(
+            _LOGIN_HTML
+            .replace('{{ERROR_BLOCK}}', error)
+            .replace('{{USERNAME_FIELD}}',
+                     '<div class="field"><label for="username">Usuário</label>'
+                     '<input type="text" id="username" name="username" '
+                     'autocomplete="username" placeholder="usuario.ad" autofocus required></div>'
+                     if ad_mode else '')
+            .replace('{{AUTOFOCUS}}', '' if ad_mode else 'autofocus'),
+            mimetype='text/html; charset=utf-8'
+        )
 
     # ---- /logout ----
     @flask_app.route('/logout')
