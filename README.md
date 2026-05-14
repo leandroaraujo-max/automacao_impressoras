@@ -885,6 +885,33 @@ git push origin main
 
 ## 📝 Changelog
 
+### Sprint 14/05/2026 — Log Viewer em Tempo Real, Nginx e Validação de Firewall
+
+#### `feat` — Log Viewer SSE no painel admin (`scan_printers.py` + `Templates/inventory_template.html`)
+- **`_ColorFormatter`**: novo handler de log com cores ANSI nativas no terminal (sem dependências externas). Níveis coloridos: DEBUG=cinza, INFO=ciano, WARNING=amarelo, ERROR=vermelho, CRITICAL=magenta.
+- **`_LogBufferHandler`**: mantém os últimos 500 registros em memória (`deque`). Suporta múltiplos subscribers via `queue.Queue` — cada consumidor SSE recebe sua própria fila.
+- **`/api/logs/recent`** *(admin)*: retorna os últimos N registros do buffer (`?n=200`, máx. 500). Autenticação obrigatória.
+- **`/api/logs/stream`** *(admin)*: SSE stream de logs ao vivo — envia histórico dos últimos 50 registros como "catch-up" e, em seguida, cada novo registro em tempo real. Keepalive automático a cada 15 s (`': keepalive\n\n'`). Headers `Cache-Control: no-cache` e `X-Accel-Buffering: no` para compatibilidade com nginx.
+- **Log Viewer no frontend** (`inventory_template.html`): painel colapsável disponível apenas para admin. Exibe logs coloridos por nível, thread name, timestamp. Auto-scroll configurável + botão "Limpar". Status de conexão SSE (conectando / ativo / pausado).
+
+#### `feat` — Configuração nginx (`nginx_config/nginx.conf`) — novo arquivo
+- Proxy reverso nginx escutando na porta 80, encaminhando para Flask em `127.0.0.1:8080`.
+- `server_name` configurado para `goi-cds.magazineluiza.intranet`, `goi-cds` e `asc-ops-cds-01.magazineluiza.intranet`.
+- Redireciona `/` → `/home` via `return 301`.
+- Headers `X-Real-IP`, `X-Forwarded-For` e `X-Forwarded-Proto` propagados para o Flask.
+- `proxy_redirect off` para evitar reescritas indevidas de Location em respostas Flask.
+
+#### `feat` — Validação de firewall em massa (`Test-RealPrintersFirewall.ps1`) — novo arquivo
+- Script PowerShell que lê IPs reais do `impressoras.csv` e testa conectividade em escala.
+- Agrupa impressoras por filial (CD) e tipo (Laser/Térmica) e amostra N exemplares de cada grupo.
+- Parâmetros configuráveis: `$CsvPath`, `$AmostrasPorTipoPorCD` (padrão 2), `$TimeoutMs` (padrão 2000 ms).
+- Útil para validar regras de firewall antes/depois de alterações de rede.
+
+#### `chore` — Imagens (`Imagens/luizalabs-logo.png`) — novo arquivo
+- Logo Luiza Labs em PNG adicionado ao repositório para uso nos templates HTML.
+
+---
+
 ### Sprint 12/05/2026 — Resiliência, Refatoração e Automação
 
 #### `ea12aac` — feat: ZebraAdapter 100% HTTP/SNMP + background scheduler
