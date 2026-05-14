@@ -242,7 +242,16 @@ def _check_ldap_auth(username: str, password: str) -> bool:
         return True
 
     except Exception as _exc:
-        log.debug(f'[ldap] Falha na autenticação LDAP para {username!r}: {_exc}')
+        _exc_type = type(_exc).__name__
+        _exc_msg  = str(_exc)
+        # Erros de rede/config vs. credenciais erradas
+        _is_network_err = any(kw in _exc_msg.lower() for kw in
+            ('connection', 'timeout', 'refused', 'unreachable', 'no servers',
+             'socket', 'name or service', 'srv', 'pool'))
+        if _is_network_err:
+            log.warning(f'[ldap] ERRO DE REDE para {username!r}: {_exc_type}: {_exc_msg[:200]}')
+        else:
+            log.warning(f'[ldap] Credenciais inválidas para {username!r}: {_exc_type}: {_exc_msg[:200]}')
         return False
 
 
@@ -255,16 +264,33 @@ def _check_admin_password(password: str, username: str = '') -> bool:
 
     O fallback garante acesso mesmo se o AD estiver indisponível.
     """
-    import hmac
-    # Ativa autenticação AD se AD_DOMAIN configurado (AD_SERVER é opcional)
+    import hmac, socket as _sock
+    # Ativa autenticação AD se AD_DOMAIN configurado
     if AD_DOMAIN and username:
         ldap_ok = _check_ldap_auth(username, password)
         if ldap_ok:
             return True
-        # LDAP falhou (rede, credenciais erradas, fora do grupo).
-        # Fallback local apenas para username == 'admin' (conta de emergência).
-        if username != 'admin':
-            return False
+
+        # Distingue erro de rede (DC inacessível) de credenciais erradas.
+        # Testa conectividade TCP ao primeiro DC descoberto.
+        _dc_reachable = False
+        try:
+            _srvs = _discover_ldap_servers()
+            if _srvs:
+                _host = _srvs[0].host
+                _port = 636 if AD_USE_SSL else 389
+                with _sock.create_connection((_host, _port), timeout=3):
+                    _dc_reachable = True
+        except Exception:
+            pass
+
+        if _dc_reachable:
+            # DC acessível → credenciais/grupo errado → bloqueia (exceto 'admin')
+            if username != 'admin':
+                return False
+        else:
+            # DC inacessível → fallback emergência para qualquer usuário
+            log.warning(f'[ldap] DC inacessível — fallback admin.key para {username!r}')
 
     # Autenticação local (admin.key)
     expected = _load_admin_password()
