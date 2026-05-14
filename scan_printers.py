@@ -340,6 +340,7 @@ _scan_status: dict = {
     'networks_total':  0,
     'started_at':      None,
     'finished_at':     None,
+    'cd_summary':      {},
 }
 
 # Momento de início do servidor — exposto via /healthcheck
@@ -2480,16 +2481,26 @@ def run_full_scan(update_only: bool = False) -> list[dict]:
     _scan_status['networks_total'] = len(entries)
     log.info(f'Scan nmap em {len(entries)} redes ({len(known_ips)} hosts já conhecidos)...')
 
+    # Agrupa entradas por CD para log de resumo
+    from collections import defaultdict as _dd
+    cd_new_counts: dict = _dd(int)
+    cd_new_lock   = threading.Lock()
+
     def _scan_worker(entry: dict) -> None:
         results = scan_network(entry, known_ips)
         with lock:
+            new_count = 0
             for p in results:
+                if p['ip'] not in all_printers:
+                    new_count += 1
                 all_printers[p['ip']] = p
             _scan_status['total']         = len(all_printers)
             _scan_status['networks_done'] += 1
             # Salva cache incrementalmente a cada rede concluída
             if results:
                 save_cache(list(all_printers.values()))
+        with cd_new_lock:
+            cd_new_counts[entry['cd']] += new_count
 
     threads_scan = [
         threading.Thread(
@@ -2504,10 +2515,18 @@ def run_full_scan(update_only: bool = False) -> list[dict]:
         t.join()
 
     result = list(all_printers.values())
+    new_total = len(result) - len(known_ips)
     log.info(
         f'Scan concluído — {len(result)} impressoras '
-        f'({len(result) - len(known_ips)} novas, {len(known_ips)} atualizadas)'
+        f'({new_total} novas, {len(known_ips)} atualizadas)'
     )
+    # Log resumo por CD
+    if cd_new_counts:
+        for cd, cnt in sorted(cd_new_counts.items()):
+            log.info(f'  [resumo] CD {cd}: {cnt} nova(s) impressora(s) encontrada(s)')
+    else:
+        log.info('  [resumo] Nenhum host novo encontrado — todos os CDs já estavam em cache')
+    _scan_status['cd_summary'] = dict(cd_new_counts)
     save_cache(result)
     _scan_status['running']     = False
     _scan_status['finished_at'] = datetime.now().isoformat(timespec='seconds')
@@ -2597,6 +2616,7 @@ input:focus{border-color:#3b82f6;box-shadow:0 0 0 3px rgba(59,130,246,.15);}
 .pub-link{font-size:.78rem;color:#475569;}
 .pub-link a{color:#60a5fa;text-decoration:none;font-weight:600;}
 .pub-link a:hover{text-decoration:underline;}
+.ad-hint{font-size:.78rem;color:#64748b;text-align:center;line-height:1.4;}
 </style>
 </head>
 <body>
@@ -2607,6 +2627,7 @@ input:focus{border-color:#3b82f6;box-shadow:0 0 0 3px rgba(59,130,246,.15);}
   </div>
   <div class="divider"></div>
   {{ERROR_BLOCK}}
+  {{AD_HINT}}
   <form method="POST" autocomplete="off" style="width:100%%;display:flex;flex-direction:column;gap:1.1rem;">
     {{USERNAME_FIELD}}
     <div class="field">
@@ -2661,7 +2682,10 @@ def _register_routes(flask_app, req, jsonify_fn, render_tmpl):
             .replace('{{USERNAME_FIELD}}',
                      '<div class="field"><label for="username">Usuário</label>'
                      '<input type="text" id="username" name="username" '
-                     'autocomplete="username" placeholder="usuario.ad" autofocus required></div>'
+                     'autocomplete="username" placeholder="ex: joao.silva" autofocus required></div>'
+                     if ad_mode else '')
+            .replace('{{AD_HINT}}',
+                     '<p class="ad-hint">&#128101; Use o mesmo login e senha do seu computador Windows</p>'
                      if ad_mode else '')
             .replace('{{AUTOFOCUS}}', '' if ad_mode else 'autofocus'),
             mimetype='text/html; charset=utf-8'
@@ -2671,18 +2695,20 @@ def _register_routes(flask_app, req, jsonify_fn, render_tmpl):
     @flask_app.route('/logout')
     def logout():
         session.clear()
-        return redirect('/home')
+        return redirect('/login')
 
-    # ---- /home  (leitura pública) ----
+    # ---- /home  (requer autenticação) ----
     @flask_app.route('/')
     @flask_app.route('/home')
     def home():
-        """Inventário público — somente leitura."""
+        """Inventário — requer autenticação."""
+        if not _is_admin():
+            return redirect('/login?next=/home')
         cache = load_cache()
         if not cache and not _scan_status['running']:
             return FlaskResponse(
                 '<p style="font-family:sans-serif;padding:2rem;color:#ccc">'
-                'Cache vazio. Peça ao administrador para executar um scan.</p>',
+                'Cache vazio. Execute um scan completo no painel administrativo.</p>',
                 status=404, mimetype='text/html'
             )
         printers = list(cache.values())
