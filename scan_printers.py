@@ -67,106 +67,13 @@ except ImportError:
     SNMP_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
-# Logging — console colorido (ANSI nativo) + buffer SSE + arquivo rotativo
+# Logging
 # ---------------------------------------------------------------------------
-
-class _ColorFormatter(logging.Formatter):
-    """Formata logs com cores ANSI para o terminal — sem dependências externas."""
-    _RESET  = '\x1b[0m'
-    _BOLD   = '\x1b[1m'
-    _COLORS = {
-        logging.DEBUG:    '\x1b[2;37m',   # cinza tênue
-        logging.INFO:     '\x1b[0;36m',   # ciano
-        logging.WARNING:  '\x1b[1;33m',   # amarelo negrito
-        logging.ERROR:    '\x1b[1;31m',   # vermelho negrito
-        logging.CRITICAL: '\x1b[1;35m',   # magenta negrito
-    }
-    _LEVEL_LABELS = {
-        logging.DEBUG:    'DEBUG   ',
-        logging.INFO:     'INFO    ',
-        logging.WARNING:  'WARNING ',
-        logging.ERROR:    'ERROR   ',
-        logging.CRITICAL: 'CRITICAL',
-    }
-
-    def format(self, record: logging.LogRecord) -> str:
-        color = self._COLORS.get(record.levelno, '')
-        label = self._LEVEL_LABELS.get(record.levelno, record.levelname.ljust(8))
-        ts    = self.formatTime(record, '%H:%M:%S')
-        thread = record.threadName[:18].ljust(18)
-        msg    = record.getMessage()
-        if record.exc_info:
-            msg += '\n' + self.formatException(record.exc_info)
-        return (
-            f'\x1b[2;37m{ts}{self._RESET} '
-            f'{color}{self._BOLD}{label}{self._RESET} '
-            f'\x1b[0;34m{thread}{self._RESET} '
-            f'{color}{msg}{self._RESET}'
-        )
-
-
-import collections as _collections
-import queue as _queue
-
-class _LogBufferHandler(logging.Handler):
-    """Mantém os últimos N registros em memória para o endpoint SSE/recent."""
-    _MAX   = 500
-    _queue: '_queue.Queue[dict]'  # fila para SSE consumers
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.buffer: '_collections.deque[dict]' = _collections.deque(maxlen=self._MAX)
-        self._subscribers: 'list[_queue.Queue]' = []
-        self._sub_lock = threading.Lock()
-
-    def emit(self, record: logging.LogRecord) -> None:
-        entry = {
-            'ts':     self.formatTime(record, '%H:%M:%S'),
-            'level':  record.levelname,
-            'thread': record.threadName,
-            'msg':    record.getMessage(),
-        }
-        self.buffer.append(entry)
-        with self._sub_lock:
-            dead = []
-            for q in self._subscribers:
-                try:
-                    q.put_nowait(entry)
-                except _queue.Full:
-                    dead.append(q)
-            for q in dead:
-                self._subscribers.remove(q)
-
-    def subscribe(self) -> '_queue.Queue[dict]':
-        q: '_queue.Queue[dict]' = _queue.Queue(maxsize=200)
-        with self._sub_lock:
-            self._subscribers.append(q)
-        return q
-
-    def unsubscribe(self, q: '_queue.Queue[dict]') -> None:
-        with self._sub_lock:
-            try:
-                self._subscribers.remove(q)
-            except ValueError:
-                pass
-
-    # necessário para formatTime sem Formatter atribuído
-    def formatTime(self, record: logging.LogRecord, datefmt: str = '') -> str:  # type: ignore[override]
-        return datetime.fromtimestamp(record.created).strftime(datefmt or '%H:%M:%S')
-
-
-# Instância global do buffer — usada pelos endpoints Flask
-_log_buffer = _LogBufferHandler()
-_log_buffer.setLevel(logging.DEBUG)
-
-# Console handler com cores
-_console_handler = logging.StreamHandler()
-_console_handler.setFormatter(_ColorFormatter())
-_console_handler.setLevel(logging.INFO)
-
-logging.basicConfig(level=logging.DEBUG, handlers=[_console_handler, _log_buffer])
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(threadName)s — %(message)s',
+)
 log = logging.getLogger(__name__)
-
 
 def _setup_file_logging() -> None:
     """Adiciona RotatingFileHandler ao logger raiz.
@@ -2866,51 +2773,6 @@ def _register_routes(flask_app, req, jsonify_fn, render_tmpl):
     def api_status():
         """Status do scan em andamento."""
         return jsonify_fn(dict(_scan_status))
-
-    @flask_app.route('/api/logs/recent')
-    def api_logs_recent():
-        """[ADMIN] Retorna os últimos N registros do buffer de log em memória."""
-        if not _is_admin():
-            return jsonify_fn({'error': 'Não autorizado'}), 403
-        try:
-            n = min(int(req.args.get('n', 200)), 500)
-        except (ValueError, TypeError):
-            n = 200
-        entries = list(_log_buffer.buffer)[-n:]
-        return jsonify_fn({'logs': entries})
-
-    @flask_app.route('/api/logs/stream')
-    def api_logs_stream():
-        """[ADMIN] SSE stream — envia cada novo registro de log como event."""
-        if not _is_admin():
-            return jsonify_fn({'error': 'Não autorizado'}), 403
-
-        def _generate():
-            q = _log_buffer.subscribe()
-            try:
-                # Envia os últimos 50 registros históricos como "catch-up"
-                for entry in list(_log_buffer.buffer)[-50:]:
-                    yield f'data: {json.dumps(entry, ensure_ascii=False)}\n\n'
-                # Stream de novos registros
-                while True:
-                    try:
-                        entry = q.get(timeout=15)
-                        yield f'data: {json.dumps(entry, ensure_ascii=False)}\n\n'
-                    except _queue.Empty:
-                        yield ': keepalive\n\n'
-            except GeneratorExit:
-                pass
-            finally:
-                _log_buffer.unsubscribe(q)
-
-        return flask_app.response_class(
-            _generate(),
-            mimetype='text/event-stream',
-            headers={
-                'Cache-Control': 'no-cache',
-                'X-Accel-Buffering': 'no',
-            },
-        )
 
     @flask_app.route('/api/online-status')
     def api_online_status():

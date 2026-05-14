@@ -250,36 +250,6 @@ td.td-dns-bad { background: rgba(239,68,68,.1); }
   display:none; line-height:1.6; }
 .flask-warn code { background:#1a0f00; padding:1px 6px; border-radius:3px;
   font-family:"Cascadia Code",Consolas,monospace; font-size:.78rem; }
-/* ---- Log viewer (admin) ---- */
-#log-panel { background:#0c0e14; border:1px solid #2d3148; border-radius:12px;
-  margin-bottom:16px; overflow:hidden; display:none; }
-.log-panel-hdr { display:flex; align-items:center; gap:8px; padding:8px 14px;
-  cursor:pointer; background:#13161f; border-bottom:1px solid #2d3148; user-select:none; }
-.log-panel-hdr h3 { font-size:.82rem; font-weight:700; color:#f1f5f9; margin:0; flex:1; }
-.log-dot { width:8px; height:8px; border-radius:50%; background:#22c55e;
-  animation: logblink 1.4s infinite; flex-shrink:0; }
-.log-dot.paused { background:#475569; animation:none; }
-@keyframes logblink { 0%,100%{opacity:1} 50%{opacity:.25} }
-#log-body { font-family:"Cascadia Code",Consolas,"Courier New",monospace;
-  font-size:.72rem; line-height:1.55; padding:10px 12px; height:220px;
-  overflow-y:auto; display:flex; flex-direction:column; gap:1px; }
-.log-entry { display:flex; gap:6px; white-space:pre-wrap; word-break:break-all; }
-.log-ts     { color:#475569; flex-shrink:0; }
-.log-lvl    { flex-shrink:0; font-weight:700; min-width:52px; }
-.log-thread { color:#60a5fa; flex-shrink:0; min-width:110px; overflow:hidden;
-  text-overflow:ellipsis; white-space:nowrap; }
-.log-msg    { color:#cbd5e1; flex:1; }
-.log-INFO    { color:#22d3ee; }
-.log-WARNING { color:#fbbf24; }
-.log-ERROR   { color:#f87171; }
-.log-CRITICAL{ color:#e879f9; }
-.log-DEBUG   { color:#475569; }
-.log-footer  { display:flex; align-items:center; justify-content:space-between;
-  padding:4px 14px 6px; border-top:1px solid #1e2233; }
-.log-footer span { font-size:.68rem; color:#475569; }
-.btn-log-clear { background:none; border:none; color:#475569; font-size:.72rem;
-  cursor:pointer; padding:2px 6px; }
-.btn-log-clear:hover { color:#94a3b8; }
 </style>
 </head>
 <body>
@@ -387,23 +357,6 @@ td.td-dns-bad { background: rgba(239,68,68,.1); }
     <div class="scan-progress" id="scan-progress-info" style="display:none">
       <span id="scan-progress-text"><b>Scan em andamento…</b></span>
       <div class="scan-bar-wrap"><div class="scan-bar" id="scan-bar"></div></div>
-    </div>
-  </div>
-
-  <!-- ---- Log viewer — somente admin ---- -->
-  <div id="log-panel">
-    <div class="log-panel-hdr" onclick="_logToggle()">
-      <span class="log-dot" id="log-dot"></span>
-      <h3>&#128196; Logs do Servidor</h3>
-      <span id="log-count" style="font-size:.68rem;color:#475569;margin-right:8px"></span>
-      <span id="log-arrow" style="color:#64748b;font-size:.75rem">&#9660;</span>
-    </div>
-    <div id="log-panel-body" style="display:none">
-      <div id="log-body"></div>
-      <div class="log-footer">
-        <span id="log-status">Conectando…</span>
-        <button class="btn-log-clear" onclick="_logClear()">&#10005; Limpar</button>
-      </div>
     </div>
   </div>
 
@@ -951,91 +904,6 @@ function _pollScanStatus() {
     if (s.running) { _setScanRunning(true); _pollScanStatus(); }
   })
   .catch(function() {});
-})();
-
-// ---- Log viewer (SSE) -------------------------------------------------------
-(function _initLogViewer() {
-  if (!IS_ADMIN) return;
-  var panel   = document.getElementById('log-panel');
-  var body    = document.getElementById('log-body');
-  var dot     = document.getElementById('log-dot');
-  var statusEl= document.getElementById('log-status');
-  var countEl = document.getElementById('log-count');
-  var arrow   = document.getElementById('log-arrow');
-  var panelBody = document.getElementById('log-panel-body');
-  if (!panel) return;
-  panel.style.display = '';
-
-  var _count  = 0;
-  var _sse    = null;
-  var _open   = false;
-  var _autoScroll = true;
-
-  var _LEVEL_COLORS = {INFO:'log-INFO',WARNING:'log-WARNING',ERROR:'log-ERROR',
-                       CRITICAL:'log-CRITICAL',DEBUG:'log-DEBUG'};
-
-  function _appendEntry(e) {
-    var row = document.createElement('div');
-    row.className = 'log-entry';
-    var lvlCls = _LEVEL_COLORS[e.level] || 'log-DEBUG';
-    row.innerHTML =
-      '<span class="log-ts">' + _esc(e.ts) + '</span>' +
-      '<span class="log-lvl ' + lvlCls + '">' + _esc((e.level||'').padEnd(8)) + '</span>' +
-      '<span class="log-thread">' + _esc((e.thread||'').substring(0,18)) + '</span>' +
-      '<span class="log-msg">' + _esc(e.msg) + '</span>';
-    body.appendChild(row);
-    _count++;
-    countEl.textContent = _count + ' entradas';
-    // Remove excesso (mantém últimas 500 no DOM)
-    while (body.children.length > 500) body.removeChild(body.firstChild);
-    if (_autoScroll) body.scrollTop = body.scrollHeight;
-  }
-
-  function _esc(s) {
-    return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  }
-
-  function _connect() {
-    if (_sse) { _sse.close(); _sse = null; }
-    statusEl.textContent = 'Conectando…';
-    dot.className = 'log-dot paused';
-    _sse = new EventSource(PROBE_BASE + '/api/logs/stream', {withCredentials: true});
-    _sse.onopen = function() {
-      dot.className = 'log-dot';
-      statusEl.textContent = 'Ao vivo';
-    };
-    _sse.onmessage = function(ev) {
-      try { _appendEntry(JSON.parse(ev.data)); } catch(e) {}
-    };
-    _sse.onerror = function() {
-      dot.className = 'log-dot paused';
-      statusEl.textContent = 'Reconectando…';
-      _sse.close(); _sse = null;
-      setTimeout(_connect, 5000);
-    };
-  }
-
-  // Auto-scroll: pause se usuário scrollou manualmente para cima
-  body.addEventListener('scroll', function() {
-    _autoScroll = (body.scrollTop + body.clientHeight >= body.scrollHeight - 20);
-  });
-
-  window._logToggle = function() {
-    _open = !_open;
-    panelBody.style.display = _open ? '' : 'none';
-    arrow.innerHTML = _open ? '&#9650;' : '&#9660;';
-    if (_open && !_sse) _connect();
-  };
-
-  window._logClear = function() {
-    while (body.firstChild) body.removeChild(body.firstChild);
-    _count = 0; countEl.textContent = '';
-  };
-
-  // Abre automaticamente se scan estiver rodando
-  fetch(PROBE_BASE + '/api/status').then(function(r){return r.json();}).then(function(s){
-    if (s.running) window._logToggle();
-  }).catch(function(){});
 })();
 
 function applyDnsAction() {
