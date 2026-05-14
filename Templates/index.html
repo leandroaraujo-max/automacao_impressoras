@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Scanner de Impressoras</title>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            background: #0f1117;
+            color: #e2e8f0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .card {
+            background: #1a1d27;
+            border: 1px solid #2d3148;
+            border-radius: 16px;
+            padding: 48px 56px;
+            text-align: center;
+            max-width: 480px;
+            width: 100%;
+            box-shadow: 0 24px 64px rgba(0,0,0,0.5);
+        }
+
+        .icon {
+            font-size: 3rem;
+            margin-bottom: 20px;
+            display: block;
+        }
+
+        h1 {
+            font-size: 1.6rem;
+            font-weight: 700;
+            color: #f1f5f9;
+            margin-bottom: 12px;
+            letter-spacing: -0.3px;
+        }
+
+        p {
+            font-size: 0.95rem;
+            color: #94a3b8;
+            line-height: 1.6;
+            margin-bottom: 36px;
+        }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            background: linear-gradient(135deg, #3b82f6, #2563eb);
+            color: #fff;
+            border: none;
+            border-radius: 10px;
+            padding: 14px 32px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.15s, box-shadow 0.15s, opacity 0.15s;
+            box-shadow: 0 4px 20px rgba(59,130,246,0.35);
+        }
+
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 28px rgba(59,130,246,0.5);
+        }
+
+        .btn:active {
+            transform: translateY(0);
+            opacity: 0.9;
+        }
+
+        .btn svg {
+            width: 18px;
+            height: 18px;
+            fill: none;
+            stroke: currentColor;
+            stroke-width: 2;
+            stroke-linecap: round;
+            stroke-linejoin: round;
+        }
+
+        .badge {
+            display: inline-block;
+            background: #1e2535;
+            border: 1px solid #2d3148;
+            color: #64748b;
+            font-size: 0.75rem;
+            padding: 4px 12px;
+            border-radius: 20px;
+            margin-top: 28px;
+        }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <span class="icon">🖨️</span>
+        <h1>Scanner de Impressoras</h1>
+        <p>Localiza e identifica impressoras HP, Samsung, Zebra e Honeywell distribuídas nas redes dos CDs e escritórios.</p>
+        <form action="/scan" method="post">
+            <button type="submit" class="btn">
+                <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                Iniciar Scan de Rede
+            </button>
+        </form>
+        <span class="badge">Redes lidas de redes.csv</span>
+    </div>
+</body>
+</html>

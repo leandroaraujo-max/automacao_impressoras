@@ -1,0 +1,41 @@
+# ============================================================
+# .gitignore — Scanner de Impressoras
+# ============================================================
+
+# ---- Segredos e credenciais ----
+# admin.key  → senha do painel admin (texto simples)
+# *.key      → qualquer outro arquivo de chave/senha criado futuramente
+*.key
+
+# ---- Configuração local com valores reais (não versionar) ----
+# Use .env.example como template; copie para .env e preencha localmente
+.env
+
+# ---- Dados gerados em runtime ----
+cache.json
+inventory.html
+printer_credentials.json
+
+# ---- Logs rotativos ----
+automacao.log
+automacao.log.*
+
+# ---- Dados de rede (IPs, CIDRs — informação sensível de infraestrutura) ----
+*.csv
+
+# ---- Python ----
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# ---- Windows / sistema operacional ----
+*.bat
+*.txt
+Thumbs.db
+desktop.ini

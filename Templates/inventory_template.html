@@ -1,0 +1,1280 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Inventário de Impressoras</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: "Segoe UI", system-ui, sans-serif; background: #0f1117; color: #e2e8f0; min-height: 100vh; }
+
+/* ---- Layout ---- */
+.sidebar {
+  position: fixed; top: 0; left: 0; bottom: 0; width: 240px;
+  background: #13161f; border-right: 1px solid #2d3148;
+  display: flex; flex-direction: column; z-index: 100; overflow: hidden;
+}
+.main { margin-left: 240px; padding: 24px 24px 60px; min-height: 100vh; }
+
+/* ---- Sidebar ---- */
+.sidebar-header { padding: 14px 16px 12px; border-bottom: 1px solid #2d3148; flex-shrink: 0; }
+.sidebar-logo { display: block; width: 120px; margin-bottom: 8px; filter: brightness(1.15) drop-shadow(0 1px 2px rgba(0,0,0,.5)); }
+.sidebar-header h2 { font-size: .88rem; font-weight: 700; color: #f1f5f9; }
+.sidebar-header .ts { font-size: .68rem; color: #475569; margin-top: 4px; }
+.sidebar-search { padding: 10px 12px; border-bottom: 1px solid #2d3148; flex-shrink: 0; }
+.sidebar-search input {
+  width: 100%; background: #1a1d27; border: 1px solid #2d3148;
+  border-radius: 6px; color: #e2e8f0; padding: 6px 10px;
+  font-size: .8rem; outline: none; transition: border-color .15s;
+}
+.sidebar-search input:focus { border-color: #3b82f6; }
+.cd-list { overflow-y: auto; flex: 1; padding: 6px 0; }
+.cd-item {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 16px; cursor: pointer; font-size: .84rem; color: #94a3b8;
+  transition: background .12s, color .12s; user-select: none; gap: 8px;
+  border-left: 2px solid transparent;
+}
+.cd-item:hover { background: #1a1d27; color: #e2e8f0; }
+.cd-item.active { background: #1a2a4a; color: #60a5fa; border-left-color: #3b82f6; font-weight: 600; }
+.cd-item.cd-hidden { display: none; }
+.cd-item .cd-num { font-weight: 700; }
+.cd-item .cd-cnt { font-size: .68rem; background: #1e2535; border-radius: 10px; padding: 1px 7px; flex-shrink: 0; }
+.cd-item.active .cd-cnt { background: #1a3060; color: #93c5fd; }
+.sidebar-footer { padding: 10px 14px; border-top: 1px solid #2d3148; flex-shrink: 0; display: flex; flex-direction: column; gap: 6px; }
+.sidebar-footer a, .sidebar-footer button {
+  display: block; width: 100%; text-align: center;
+  padding: 7px 10px; border-radius: 7px; font-size: .78rem; font-weight: 600;
+  text-decoration: none; cursor: pointer; border: none; transition: opacity .15s;
+}
+.sidebar-footer a { background: #1a2a4a; color: #60a5fa; }
+.sidebar-footer button { background: #1a2035; border: 1px solid #2d3148; color: #64748b; }
+.sidebar-footer a:hover, .sidebar-footer button:hover { opacity: .8; }
+
+/* ---- Topbar ---- */
+.topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; flex-wrap: wrap; gap: 12px; }
+.topbar h1 { font-size: 1.15rem; font-weight: 700; color: #f1f5f9; }
+.ts-badge { font-size: .76rem; color: #64748b; background: #1a1d27; border: 1px solid #2d3148; border-radius: 20px; padding: 4px 12px; }
+
+/* ---- Stats ---- */
+.stats-bar { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 20px; }
+.stat-card { background: #1a1d27; border: 1px solid #2d3148; border-radius: 10px; padding: 10px 18px; min-width: 110px; }
+.stat-label { font-size: .65rem; color: #64748b; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; }
+.stat-value { font-size: 1.3rem; font-weight: 700; color: #f1f5f9; margin-top: 2px; }
+.stat-value.blue { color: #60a5fa; } .stat-value.amber { color: #fbbf24; } .stat-value.green { color: #4ade80; }
+
+/* ---- Filters ---- */
+.filters-bar { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 16px; }
+.filter-group { display: flex; flex-direction: column; gap: 3px; }
+.filter-group label { font-size: .66rem; color: #64748b; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; }
+.filter-input, .filter-select {
+  background: #1a1d27; border: 1px solid #2d3148; border-radius: 7px;
+  color: #e2e8f0; padding: 6px 10px; font-size: .8rem; min-width: 130px; outline: none; transition: border-color .15s;
+}
+.filter-input:focus, .filter-select:focus { border-color: #3b82f6; }
+.filter-select option { background: #1a1d27; }
+.btn-clear { background: #1a1d27; border: 1px solid #2d3148; color: #64748b; padding: 6px 14px; border-radius: 7px; font-size: .78rem; cursor: pointer; }
+.btn-clear:hover { color: #e2e8f0; border-color: #475569; }
+.visible-count { font-size: .76rem; color: #64748b; align-self: flex-end; margin-left: auto; }
+
+/* ---- Scan status banner ---- */
+.scan-banner {
+  display: flex; align-items: center; gap: 10px; padding: 9px 16px;
+  border-radius: 9px; margin-bottom: 18px; font-size: .82rem; font-weight: 600;
+  border: 1px solid; transition: opacity .3s;
+}
+.scan-banner.running  { background: #1a2a4a; border-color: #2d4a8a; color: #60a5fa; }
+.scan-banner.done     { background: #0d2218; border-color: #166534; color: #4ade80; }
+.scan-banner .spin    { display: inline-block; animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.scan-banner .f5-hint { margin-left: auto; font-size: .7rem; color: #475569; font-weight: 400; }
+
+/* ---- State msg ---- */
+.state-msg { text-align: center; padding: 60px 20px; color: #475569; font-size: .9rem; }
+.state-msg strong { display: block; font-size: 1.5rem; margin-bottom: 10px; color: #64748b; }
+
+/* ---- Table ---- */
+/* overflow:auto + max-height: scrollbar horizontal aparece no meio da pagina,
+   e o header fica fixo durante a rolagem vertical */
+.table-wrap { overflow: auto; max-height: calc(100vh - 310px); min-height: 280px; border-radius: 12px; border: 1px solid #2d3148; background: #1a1d27; }
+table { width: 100%; border-collapse: collapse; }
+thead tr { background: #141720; }
+th {
+  padding: 10px 14px; text-align: left; font-size: .65rem; font-weight: 700; color: #64748b;
+  text-transform: uppercase; letter-spacing: .6px; border-bottom: 2px solid #2d3148; white-space: nowrap;
+  /* sticky header */
+  position: sticky; top: 0; z-index: 10; background: #141720;
+  /* sortable columns */
+  cursor: pointer; user-select: none; transition: color .12s, background .12s;
+}
+th:hover { color: #94a3b8; background: #191d2b; }
+th.sortable::after  { content: ' \2B0D'; opacity: 0.25; font-size: .65rem; }
+th.sort-asc::after  { content: ' \2191'; color: #60a5fa; font-size: .7rem; opacity: 1; }
+th.sort-desc::after { content: ' \2193'; color: #60a5fa; font-size: .7rem; opacity: 1; }
+th.no-sort { cursor: default; }
+th.no-sort::after { content: none; }
+td { padding: 9px 14px; font-size: .82rem; color: #cbd5e1; border-bottom: 1px solid #1e2233; vertical-align: middle; }
+tbody tr:last-child td { border-bottom: none; }
+tbody tr:hover { background: #1f2235; }
+.row-hidden { display: none; }
+
+/* ---- Cells ---- */
+.cell-ip { font-family: "Cascadia Code", Consolas, monospace; color: #38bdf8; font-size: .8rem; text-decoration: none; }
+.cell-ip:hover { text-decoration: underline; color: #7dd3fc; }
+.probe-lnk { font-size: .75rem; margin-left: 5px; text-decoration: none; opacity: .25; transition: opacity .15s; }
+.probe-lnk:hover { opacity: 1; }
+.cell-modelo { font-size: .78rem; color: #94a3b8; max-width: 180px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cell-modelo.na { color: #374151; font-style: italic; }
+.badge-mfr { display: inline-block; padding: 2px 9px; border-radius: 6px; font-size: .7rem; font-weight: 700; border: 1px solid; white-space: nowrap; }
+.mfr-hp        { background: #0c2044; color: #60a5fa; border-color: #1e3a6e; }
+.mfr-samsung   { background: #0a1f3a; color: #38bdf8; border-color: #164e7a; }
+.mfr-zebra     { background: #1a1208; color: #fbbf24; border-color: #5a3e08; }
+.mfr-honeywell { background: #1a0a0a; color: #f87171; border-color: #5a1414; }
+.mfr-desconhecido { background: #1e1e2e; color: #94a3b8; border-color: #374151; }
+.cell-mono { font-family: "Cascadia Code", Consolas, monospace; font-size: .78rem; }
+.cell-mono.na { color: #374151; font-style: italic; }
+.v-pages { color: #34d399; font-weight: 600; }
+.v-odom  { color: #fbbf24; font-weight: 600; }
+.v-toner { font-weight: 600; }
+.v-ok    { color: #4ade80; }
+.v-warn  { color: #fbbf24; }
+.v-crit  { color: #f87171; }
+.tipo-badge { font-size: .65rem; font-weight: 700; padding: 1px 7px; border-radius: 5px; border: 1px solid; text-transform: uppercase; }
+.tipo-laser   { background: #1a2a4a; color: #60a5fa; border-color: #2d4a8a; }
+.tipo-termica { background: #2a1f0a; color: #fbbf24; border-color: #7c5a0a; }
+.status-online  { display: inline-flex; align-items: center; gap: 5px; font-size: .75rem; font-weight: 600; color: #4ade80; }
+.status-online::before  { content: ""; width: 6px; height: 6px; background: #4ade80; border-radius: 50%; box-shadow: 0 0 6px #4ade80; }
+.status-offline { display: inline-flex; align-items: center; gap: 5px; font-size: .75rem; font-weight: 600; color: #94a3b8; }
+.status-offline::before { content: ""; width: 6px; height: 6px; background: #475569; border-radius: 50%; }
+.status-unknown { display: inline-flex; align-items: center; gap: 5px; font-size: .75rem; font-weight: 600; color: #64748b; }
+.status-unknown::before { content: ""; width: 6px; height: 6px; background: #334155; border-radius: 50%; }
+.ts-cell { font-size: .68rem; color: #475569; white-space: nowrap; }
+
+/* ---- DNS ---- */
+.dns-cell { font-family: "Cascadia Code", Consolas, monospace; font-size: .78rem; color: #94a3b8; }
+.dns-cell.na { color: #374151; font-style: italic; }
+.dns-bad { color: #f87171 !important; font-weight: 700; }
+td.td-dns-bad { background: rgba(239,68,68,.1); }
+.dns-badge-set    { display:inline-block; background:#0d2218; border:1px solid #166534; color:#4ade80;
+  border-radius:5px; padding:1px 8px; font-size:.7rem; font-weight:700;
+  font-family:"Cascadia Code",Consolas,monospace; }
+.dns-badge-notset { display:inline-block; background:#2a1a00; border:1px solid #7c5a0a; color:#fbbf24;
+  border-radius:5px; padding:1px 8px; font-size:.7rem; font-weight:700;
+  font-family:"Cascadia Code",Consolas,monospace; }
+.dns-badge-none   { display:inline-block; background:#1a1d27; border:1px solid #2d3148; color:#475569;
+  border-radius:5px; padding:1px 8px; font-size:.7rem;
+  font-family:"Cascadia Code",Consolas,monospace; font-style:italic; }
+
+/* ---- DNS panel ---- */
+.dns-panel { background: #13161f; border: 1px solid #2d3148; border-radius: 12px; margin-bottom: 16px; overflow: hidden; }
+.dns-panel-hdr { display: flex; align-items: center; gap: 10px; padding: 10px 16px; cursor: pointer; user-select: none; }
+.dns-panel-hdr:hover { background: #1a1d27; }
+.dns-panel-hdr h3 { font-size: .84rem; font-weight: 700; color: #f1f5f9; margin: 0; }
+.dns-badge-ok  { font-size: .7rem; background: #0d2218; border: 1px solid #166534; color: #4ade80; border-radius: 10px; padding: 1px 9px; }
+.dns-badge-bad { font-size: .7rem; background: #2a0a0a; border: 1px solid #7f1d1d; color: #f87171; border-radius: 10px; padding: 1px 9px; }
+.dns-panel-body { border-top: 1px solid #2d3148; padding: 12px 16px 14px; }
+.btn-apply-dns {
+  background: #1a2a4a; border: 1px solid #3b82f6; color: #60a5fa;
+  padding: 6px 14px; border-radius: 7px; font-size: .8rem; font-weight: 600;
+  cursor: pointer; align-self: flex-end; transition: opacity .15s;
+}
+.btn-apply-dns:hover { opacity: .8; }
+.btn-apply-dns:disabled { opacity: .4; cursor: not-allowed; }
+@keyframes dns-spin { to { transform: rotate(360deg); } }
+.dns-spinner {
+  display: inline-block;
+  animation: dns-spin .9s linear infinite;
+  margin-right: 4px;
+}
+.dns-apply-log {
+  margin-top: 12px; background: #0f1117; border: 1px solid #2d3148;
+  border-radius: 8px; padding: 10px 12px; max-height: 220px; overflow-y: auto;
+  font-family: "Cascadia Code", Consolas, monospace; font-size: .72rem;
+  color: #94a3b8; white-space: pre-wrap; word-break: break-all;
+}
+/* ---- Auth status icon ---- */
+.auth-icon { cursor:pointer; margin-left:6px; font-size:.78rem; vertical-align:middle; user-select:none; }
+.auth-ok   { color:#4ade80; }
+.auth-fail { color:#f87171; }
+.auth-none { color:#475569; }
+/* ---- Role badge ---- */
+.role-badge { font-size:.7rem; font-weight:700; padding:2px 9px; border-radius:5px;
+  border:1px solid; text-transform:uppercase; letter-spacing:.5px; }
+.role-admin  { background:#0c2044; border-color:#1e3a6e; color:#60a5fa; }
+.role-public { background:#1a1208; border-color:#5a3e08; color:#fbbf24; }
+.btn-auth-nav { background:none; border:1px solid #2d3148; color:#94a3b8;
+  padding:4px 12px; border-radius:6px; font-size:.78rem; cursor:pointer; text-decoration:none; }
+.btn-auth-nav:hover { border-color:#475569; color:#e2e8f0; }
+/* ---- Export button ---- */
+.btn-export { background:#0f2a1a; border:1px solid #1a5c30; color:#4ade80; padding:6px 14px;
+  border-radius:7px; font-size:.78rem; font-weight:600; cursor:pointer; white-space:nowrap; }
+.btn-export:hover { opacity:.85; }
+/* ---- Scan panel ---- */
+.scan-panel { background:#13161f; border:1px solid #2d3148; border-radius:12px; margin-bottom:16px;
+  display:flex; align-items:center; gap:12px; padding:10px 16px; flex-wrap:wrap; }
+.btn-scan { background:#1a2a1a; border:1px solid #22c55e; color:#4ade80;
+  padding:7px 16px; border-radius:7px; font-size:.82rem; font-weight:700;
+  cursor:pointer; transition:opacity .15s; white-space:nowrap; }
+.btn-scan:hover { opacity:.8; }
+.btn-scan:disabled { opacity:.35; cursor:not-allowed; }
+.scan-progress { font-size:.75rem; color:#94a3b8; flex:1; min-width:150px; }
+.scan-progress b { color:#f1f5f9; }
+.scan-bar-wrap { height:4px; background:#1e2233; border-radius:4px; width:100%; margin-top:4px; }
+.scan-bar { height:4px; background:#22c55e; border-radius:4px; transition:width .4s; width:0; }
+/* ---- Credentials modal ---- */
+.modal-overlay { position:fixed; inset:0; background:rgba(0,0,0,.78); z-index:999;
+  display:flex; align-items:center; justify-content:center; }
+.modal-overlay.hidden { display:none; }
+.modal-box { background:#13161f; border:1px solid #2d3148; border-radius:14px;
+  padding:24px 28px; min-width:340px; max-width:460px; width:90%; }
+.modal-box h3 { font-size:.95rem; font-weight:700; color:#f1f5f9; margin-bottom:16px; }
+.modal-field { display:flex; flex-direction:column; gap:4px; margin-bottom:12px; }
+.modal-field label { font-size:.67rem; color:#64748b; font-weight:700;
+  text-transform:uppercase; letter-spacing:.5px; }
+.modal-field input { background:#1a1d27; border:1px solid #2d3148; border-radius:7px;
+  color:#e2e8f0; padding:8px 10px; font-size:.84rem; outline:none; transition:border-color .15s; }
+.modal-field input:focus { border-color:#3b82f6; }
+.modal-field input[readonly] { color:#64748b; cursor:default; }
+.modal-actions { display:flex; gap:10px; justify-content:flex-end; margin-top:18px; }
+.btn-mc { padding:7px 16px; border-radius:7px; font-size:.82rem; cursor:pointer;
+  border:1px solid; font-weight:600; }
+.btn-mc-cancel  { background:#1a1d27; border-color:#2d3148; color:#64748b; }
+.btn-mc-confirm { background:#1a3060; border-color:#3b82f6; color:#60a5fa; }
+.btn-mc:disabled { opacity:.4; cursor:not-allowed; }
+.modal-status { font-size:.77rem; color:#94a3b8; margin-top:10px; min-height:18px; line-height:1.5; }
+.modal-status.ok   { color:#4ade80; }
+.modal-status.fail { color:#f87171; }
+/* Banner de aviso quando aberto como file:// sem Flask */
+.flask-warn { background:#2a1500; border:1px solid #92400e; border-radius:9px;
+  padding:10px 16px; margin-bottom:14px; font-size:.8rem; color:#fbbf24;
+  display:none; line-height:1.6; }
+.flask-warn code { background:#1a0f00; padding:1px 6px; border-radius:3px;
+  font-family:"Cascadia Code",Consolas,monospace; font-size:.78rem; }
+/* ---- Log viewer (admin) ---- */
+#log-panel { background:#0c0e14; border:1px solid #2d3148; border-radius:12px;
+  margin-bottom:16px; overflow:hidden; display:none; }
+.log-panel-hdr { display:flex; align-items:center; gap:8px; padding:8px 14px;
+  cursor:pointer; background:#13161f; border-bottom:1px solid #2d3148; user-select:none; }
+.log-panel-hdr h3 { font-size:.82rem; font-weight:700; color:#f1f5f9; margin:0; flex:1; }
+.log-dot { width:8px; height:8px; border-radius:50%; background:#22c55e;
+  animation: logblink 1.4s infinite; flex-shrink:0; }
+.log-dot.paused { background:#475569; animation:none; }
+@keyframes logblink { 0%,100%{opacity:1} 50%{opacity:.25} }
+#log-body { font-family:"Cascadia Code",Consolas,"Courier New",monospace;
+  font-size:.72rem; line-height:1.55; padding:10px 12px; height:220px;
+  overflow-y:auto; display:flex; flex-direction:column; gap:1px; }
+.log-entry { display:flex; gap:6px; white-space:pre-wrap; word-break:break-all; }
+.log-ts     { color:#475569; flex-shrink:0; }
+.log-lvl    { flex-shrink:0; font-weight:700; min-width:52px; }
+.log-thread { color:#60a5fa; flex-shrink:0; min-width:110px; overflow:hidden;
+  text-overflow:ellipsis; white-space:nowrap; }
+.log-msg    { color:#cbd5e1; flex:1; }
+.log-INFO    { color:#22d3ee; }
+.log-WARNING { color:#fbbf24; }
+.log-ERROR   { color:#f87171; }
+.log-CRITICAL{ color:#e879f9; }
+.log-DEBUG   { color:#475569; }
+.log-footer  { display:flex; align-items:center; justify-content:space-between;
+  padding:4px 14px 6px; border-top:1px solid #1e2233; }
+.log-footer span { font-size:.68rem; color:#475569; }
+.btn-log-clear { background:none; border:none; color:#475569; font-size:.72rem;
+  cursor:pointer; padding:2px 6px; }
+.btn-log-clear:hover { color:#94a3b8; }
+</style>
+</head>
+<body>
+
+<!-- ======= SIDEBAR ======= -->
+<aside class="sidebar">
+  <div class="sidebar-header">
+    <img src="data:image/png;base64,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" alt="Luiza Labs" class="sidebar-logo">
+    <h2>&#128424; Impressoras</h2>
+    <div class="ts">$TIMESTAMP</div>
+  </div>
+  <div class="sidebar-search">
+    <input type="text" id="cd-search" placeholder="Buscar CD..." oninput="filterCdList()">
+  </div>
+  <div class="cd-list" id="cd-list"></div>
+  <div class="sidebar-footer">
+    <a href="http://127.0.0.1:$PROBE_PORT/probe" target="_blank">&#128269; Probe de Conectividade</a>
+    <button onclick="showAll()">Ver todos os CDs</button>
+  </div>
+</aside>
+
+<!-- ======= MAIN ======= -->
+<main class="main">
+  <!-- Aviso exibido quando inventory.html é aberto como file:// sem Flask -->
+  <div class="flask-warn" id="flask-warn">
+    &#9888; Voc&ecirc; est&aacute; visualizando este invent&aacute;rio <strong>offline</strong> (sem o servidor Flask).
+    As seguintes fun&ccedil;&otilde;es <strong>n&atilde;o funcionam</strong> neste modo:
+    exportar CSV &middot; aplicar DNS &middot; modal de credenciais &middot; probe de conectividade.<br>
+    Para habilit&aacute;-las, inicie o servidor e acesse pelo navegador:<br>
+    <code>python scan_printers.py --probe-only</code> &nbsp;&rarr;&nbsp;
+    <a href="http://127.0.0.1:$PROBE_PORT/home" target="_blank" style="color:#fbbf24">http://127.0.0.1:$PROBE_PORT/home</a>
+  </div>
+  <div class="topbar">
+    <h1 id="main-title">&#128424; Selecione um CD</h1>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <button class="btn-export" onclick="exportCSV()" title="Exportar dados vis&iacute;veis como CSV">&#8659; Exportar CSV</button>
+      <span class="ts-badge">Invent&aacute;rio: $TIMESTAMP</span>
+      <span id="role-badge" class="role-badge"></span>
+      <span id="auth-nav"></span>
+    </div>
+  </div>
+
+  <div id="scan-banner" class="scan-banner running" style="display:none">
+    <span class="spin">&#8635;</span>
+    <span id="scan-msg">Verificando status do scan...</span>
+    <span class="f5-hint">Pressione F5 para atualizar os dados</span>
+  </div>
+
+  <div class="stats-bar" id="stats-bar" style="display:none">
+    <div class="stat-card"><div class="stat-label">Total</div><div class="stat-value" id="st-total">0</div></div>
+    <div class="stat-card"><div class="stat-label">Laser</div><div class="stat-value blue" id="st-laser">0</div></div>
+    <div class="stat-card"><div class="stat-label">T&eacute;rmica</div><div class="stat-value amber" id="st-termica">0</div></div>
+    <div class="stat-card" id="st-dns-card" style="display:none"><div class="stat-label">DNS incorreto</div><div class="stat-value" style="color:#f87171" id="st-dns">0</div></div>
+  </div>
+
+  <div class="filters-bar" id="filters-bar" style="display:none">
+    <div class="filter-group">
+      <label>IP</label>
+      <input type="text" id="f-ip" class="filter-input" placeholder="Ex: 10.0.1" oninput="applyFilters()">
+    </div>
+    <div class="filter-group">
+      <label>Fabricante</label>
+      <select id="f-fab" class="filter-select" onchange="applyFilters()">
+        <option value="">Todos</option>
+        <option value="HP">HP</option>
+        <option value="Samsung">Samsung</option>
+        <option value="Zebra">Zebra</option>
+        <option value="Honeywell">Honeywell</option>
+      </select>
+    </div>
+    <div class="filter-group">
+      <label>Tipo</label>
+      <select id="f-tipo" class="filter-select" onchange="applyFilters()">
+        <option value="">Todos</option>
+        <option value="laser">Laser</option>
+        <option value="termica">T&eacute;rmica</option>
+      </select>
+    </div>
+    <div class="filter-group">
+      <label>Serial / Modelo</label>
+      <input type="text" id="f-serial" class="filter-input" placeholder="Buscar..." oninput="applyFilters()">
+    </div>
+    <div class="filter-group">
+      <label>DNS Status</label>
+      <select id="f-dns" class="filter-select" onchange="applyFilters()">
+        <option value="">Todos</option>
+        <option value="set">SET</option>
+        <option value="notset">NOT SET</option>
+        <option value="none">N&atilde;o coletado</option>
+        <option value="bad">Incorreto (&ne; alvo)</option>
+      </select>
+    </div>
+    <button class="btn-clear" onclick="clearFilters()">&#10005; Limpar</button>
+    <div class="filter-group" style="flex-direction:row;align-items:center;gap:6px;">
+      <input type="checkbox" id="f-dns-only" onchange="applyFilters()" style="accent-color:#3b82f6;cursor:pointer">
+      <label for="f-dns-only" style="text-transform:none;font-size:.78rem;color:#94a3b8;letter-spacing:0;cursor:pointer">Apenas DNS incorreto</label>
+    </div>
+    <span class="visible-count" id="visible-count"></span>
+  </div>
+
+  <!-- ---- Scan panel — somente admin ---- -->
+  <div class="scan-panel" id="scan-panel" style="display:none">
+    <button id="btn-scan-full"   class="btn-scan" onclick="startScan(false)">&#128257; Novo Scan Completo</button>
+    <button id="btn-scan-update" class="btn-scan" onclick="startScan(true)"  style="background:#1a1a2a;border-color:#818cf8;color:#a5b4fc;">&#8635; Atualizar Cache</button>
+    <div class="scan-progress" id="scan-progress-info" style="display:none">
+      <span id="scan-progress-text"><b>Scan em andamento…</b></span>
+      <div class="scan-bar-wrap"><div class="scan-bar" id="scan-bar"></div></div>
+    </div>
+  </div>
+
+  <!-- ---- Log viewer — somente admin ---- -->
+  <div id="log-panel">
+    <div class="log-panel-hdr" onclick="_logToggle()">
+      <span class="log-dot" id="log-dot"></span>
+      <h3>&#128196; Logs do Servidor</h3>
+      <span id="log-count" style="font-size:.68rem;color:#475569;margin-right:8px"></span>
+      <span id="log-arrow" style="color:#64748b;font-size:.75rem">&#9660;</span>
+    </div>
+    <div id="log-panel-body" style="display:none">
+      <div id="log-body"></div>
+      <div class="log-footer">
+        <span id="log-status">Conectando…</span>
+        <button class="btn-log-clear" onclick="_logClear()">&#10005; Limpar</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ---- DNS Config panel — somente admin ---- -->
+  <div class="dns-panel" id="dns-panel" style="display:none">
+    <div class="dns-panel-hdr" onclick="toggleDnsPanel()">
+      <h3>&#128337; DNS Alvo</h3>
+      <span id="dns-badge-ok"  class="dns-badge-ok"  style="display:none">Todos OK</span>
+      <span id="dns-badge-bad" class="dns-badge-bad" style="display:none">0 incorretos</span>
+      <span id="dns-panel-arrow" style="margin-left:auto;color:#64748b;font-size:.75rem">&#9660;</span>
+    </div>
+    <div id="dns-panel-body" class="dns-panel-body" style="display:none">
+      <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end">
+        <div class="filter-group">
+          <label>DNS Prim&aacute;rio Alvo</label>
+          <input type="text" id="target-dns1" class="filter-input" placeholder="Ex: 10.0.0.1" oninput="onTargetDnsChange()">
+        </div>
+        <div class="filter-group">
+          <label>DNS Secund&aacute;rio Alvo</label>
+          <input type="text" id="target-dns2" class="filter-input" placeholder="Ex: 10.0.0.2" oninput="onTargetDnsChange()">
+        </div>
+        <button id="btn-apply-dns" class="btn-apply-dns" onclick="applyDnsAction()" disabled>
+          &#9889; Aplicar nos incorretos
+        </button>
+      </div>
+      <div id="dns-apply-log" class="dns-apply-log" style="display:none"></div>
+    </div>
+  </div>
+
+  <div id="content">
+    <div class="state-msg">
+      <strong>&#128424;</strong>
+      Selecione um CD na barra lateral para visualizar as impressoras.
+    </div>
+  </div>
+</main>
+
+<script>
+'use strict';
+const ALL_PRINTERS = $DATA;
+const ALL_CDS      = $CDS;
+// Se a página for servida pelo Flask (http/https), usa a mesma origem para evitar CORS.
+// Se aberta como file://, usa o endereço hardcoded do servidor local.
+const PROBE_BASE   = (window.location.protocol === 'file:')
+    ? 'http://127.0.0.1:$PROBE_PORT'
+    : window.location.origin;
+const IS_ADMIN     = ($IS_ADMIN === true || '$IS_ADMIN' === 'true');
+
+// ---- Inicializa UI de acordo com o perfil ----
+(function _initRoleUI() {
+  // Badge de perfil
+  var badge = document.getElementById('role-badge');
+  if (badge) {
+    badge.textContent = IS_ADMIN ? 'Admin' : 'Público';
+    badge.className = 'role-badge ' + (IS_ADMIN ? 'role-admin' : 'role-public');
+  }
+  // Botão de navegação auth
+  var nav = document.getElementById('auth-nav');
+  if (nav) {
+    if (IS_ADMIN) {
+      nav.innerHTML = '<a href="/logout" class="btn-auth-nav" title="Sair do painel admin">&#128275; Sair</a>';
+    } else {
+      nav.innerHTML = '<a href="/admin" class="btn-auth-nav" title="Acessar painel administrativo">&#128274; Admin</a>';
+    }
+  }
+  // Painel DNS: apenas admin
+  var dnsPanel = document.getElementById('dns-panel');
+  if (dnsPanel) dnsPanel.style.display = IS_ADMIN ? '' : 'none';
+  // Painel Scan: apenas admin
+  var scanPanel = document.getElementById('scan-panel');
+  if (scanPanel) scanPanel.style.display = IS_ADMIN ? '' : 'none';
+})();
+
+// Índice por CD
+var BY_CD = {};
+ALL_PRINTERS.forEach(function(p) {
+  var cd = String(p.filial || '');
+  if (!BY_CD[cd]) BY_CD[cd] = [];
+  BY_CD[cd].push(p);
+});
+
+function esc(s) {
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function fmt(v) {
+  return (v && v !== 'N/A' && v !== 'None' && v !== 'null') ? v : null;
+}
+function fmtDate(iso) {
+  if (!iso) return '—';
+  try {
+    var d = new Date(iso);
+    return isNaN(d) ? iso : d.toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'});
+  } catch(e) { return iso; }
+}
+function tonerClass(val) {
+  var m = String(val||'').match(/(\d+)/);
+  if (!m) return 'v-toner';
+  var p = parseInt(m[1]);
+  return 'v-toner ' + (p >= 30 ? 'v-ok' : p >= 15 ? 'v-warn' : 'v-crit');
+}
+
+// Renderiza célula DNS: IP real, badge NOT SET, ou travessão
+function dnsHtml(val, isBad) {
+  if (!val) return '<span class="dns-cell na">\u2014</span>';
+  var u = val.toUpperCase();
+  if (u === 'NOT_SET' || u === 'NOTSET' || u === 'NOT SET')
+    return '<span class="dns-badge-notset" title="DNS n\u00e3o configurado manualmente (DHCP ou vazio)">NOT SET</span>';
+  return '<span class="dns-cell' + (isBad ? ' dns-bad' : '') + '">' + esc(val) + '</span>';
+}
+
+// ---- Sort ----------------------------------------------------------
+var _sortCol = null;
+var _sortDir = 1; // 1 = asc, -1 = desc
+
+function _getSortVal(p, col) {
+  var v = p[col];
+  if (col === 'ip') {
+    var pts = String(v||'').split('.').map(function(x){return parseInt(x,10)||0;});
+    return ((pts[0]||0)*16777216)+((pts[1]||0)*65536)+((pts[2]||0)*256)+(pts[3]||0);
+  }
+  if (col === 'metrica') {
+    var mm = String(v||'').match(/[\d,]+/);
+    return mm ? parseFloat(mm[0].replace(/,/g,'')) : -1;
+  }
+  if (col === 'toner' || col === 'consumivel2') {
+    var mm2 = String(v||'').match(/(\d+)/);
+    return mm2 ? parseInt(mm2[1],10) : -1;
+  }
+  if (col === 'last_updated' || col === 'first_seen') { return v ? new Date(v).getTime() : 0; }
+  return String(v||'').toLowerCase();
+}
+
+function sortBy(col) {
+  if (_sortCol === col) { _sortDir = -_sortDir; }
+  else { _sortCol = col; _sortDir = 1; }
+  _currentPrinters.sort(function(a, b) {
+    var va = _getSortVal(a, col), vb = _getSortVal(b, col);
+    return (va < vb ? -1 : va > vb ? 1 : 0) * _sortDir;
+  });
+  renderTable(_currentPrinters);
+  updateStats(_currentPrinters);
+  applyFilters();
+}
+
+function _thSort(col, label) {
+  var cls = 'sortable';
+  if (_sortCol === col) cls = _sortDir === 1 ? 'sort-asc' : 'sort-desc';
+  return '<th class="' + cls + '" onclick="sortBy(\'' + col + '\')" title="Ordenar por ' + label + '">' + label + '</th>';
+}
+
+// ---- Sidebar -------------------------------------------------------
+function buildCdList() {
+  var list = document.getElementById('cd-list');
+  list.innerHTML = '';
+  ALL_CDS.forEach(function(cd) {
+    var el = document.createElement('div');
+    el.className = 'cd-item';
+    el.dataset.cd = cd;
+    el.onclick = function() { selectCd(cd); };
+    el.innerHTML =
+      '<span class="cd-num">CD ' + esc(cd) + '</span>' +
+      '<span class="cd-cnt">' + ((BY_CD[cd]||[]).length) + '</span>';
+    list.appendChild(el);
+  });
+}
+
+function filterCdList() {
+  var q = document.getElementById('cd-search').value.trim().toLowerCase();
+  document.querySelectorAll('.cd-item').forEach(function(el) {
+    el.classList.toggle('cd-hidden', !!(q && el.dataset.cd.toLowerCase().indexOf(q) === -1));
+  });
+}
+
+function selectCd(cd) {
+  document.querySelectorAll('.cd-item').forEach(function(el) {
+    el.classList.toggle('active', el.dataset.cd === cd);
+  });
+  document.getElementById('main-title').textContent = '\uD83D\uDDE8 CD ' + cd;
+  document.getElementById('stats-bar').style.display   = 'flex';
+  document.getElementById('filters-bar').style.display = 'flex';
+  clearFilters(false);
+  var printers = BY_CD[cd] || [];
+  renderTable(printers);
+  updateStats(printers);
+}
+
+function showAll() {
+  document.querySelectorAll('.cd-item').forEach(function(el) { el.classList.remove('active'); });
+  document.getElementById('main-title').textContent = '\uD83D\uDDE8 Todos os CDs';
+  document.getElementById('stats-bar').style.display   = 'flex';
+  document.getElementById('filters-bar').style.display = 'flex';
+  clearFilters(false);
+  renderTable(ALL_PRINTERS);
+  updateStats(ALL_PRINTERS);
+}
+
+// ---- Table ---------------------------------------------------------
+function renderTable(printers) {
+  _currentPrinters = printers || [];
+  if (!printers || printers.length === 0) {
+    document.getElementById('content').innerHTML =
+      '<div class="state-msg"><strong>0</strong>Nenhuma impressora encontrada.</div>';
+    document.getElementById('visible-count').textContent = '';
+    _updateDnsBadge([]);
+    return;
+  }
+  var rows = printers.map(makeRow).join('');
+  document.getElementById('content').innerHTML =
+    '<div class="table-wrap" id="tbl-wrap"><table>' +
+    '<thead><tr>' +
+      _thSort('ip',          'IP') +
+      _thSort('fabricante',  'Fabricante') +
+      _thSort('modelo',      'Modelo') +
+      _thSort('serial',      'N.\u00ba S\u00e9rie') +
+      _thSort('metrica',     'Contador / Od\u00f4m.') +
+      _thSort('toner',       'Toner') +
+      _thSort('consumivel2', 'Kit / Drum') +
+      _thSort('tipo',        'Tipo') +
+      '<th class="no-sort">Status</th>' +
+      _thSort('hostname',    'Hostname') +
+      _thSort('dns1',        'DNS 1') +
+      _thSort('dns2',        'DNS 2') +
+      _thSort('gateway',     'Gateway') +
+      _thSort('ip_mode',     'Modo IP') +
+      _thSort('last_updated','Atualizado') +
+    '</tr></thead>' +
+    '<tbody>' + rows + '</tbody></table></div>';
+  document.getElementById('visible-count').textContent = printers.length + ' impressora(s)';
+  _updateDnsBadge(printers);
+}
+
+function makeRow(p) {
+  var mfrCls    = 'mfr-' + (p.fabricante||'').toLowerCase();
+  var tipoClass = p.tipo === 'laser' ? 'tipo-laser' : 'tipo-termica';
+  var tipoLabel = p.tipo === 'laser' ? 'Laser' : 'T\u00e9rmica';
+
+  var metVal  = fmt(p.metrica);
+  var isOdom  = metVal && String(metVal).indexOf('pol.') !== -1;
+  var metHtml = metVal
+    ? '<span class="cell-mono ' + (isOdom ? 'v-odom' : 'v-pages') + '">' + esc(metVal) + '</span>'
+    : '<span class="cell-mono na">\u2014</span>';
+
+  var tonerVal  = fmt(p.toner);
+  var tonerHtml = tonerVal
+    ? '<span class="cell-mono ' + tonerClass(tonerVal) + '">' + esc(tonerVal) + '</span>'
+    : '<span class="cell-mono na">\u2014</span>';
+
+  var c2Val  = fmt(p.consumivel2);
+  var c2Html = c2Val
+    ? '<span class="cell-mono ' + tonerClass(c2Val) + '">' + esc(c2Val) + '</span>'
+    : '<span class="cell-mono na">\u2014</span>';
+
+  var modelVal  = fmt(p.modelo);
+  var modelHtml = modelVal
+    ? '<span class="cell-modelo" title="' + esc(modelVal) + '">' + esc(modelVal) + '</span>'
+    : '<span class="cell-modelo na">\u2014</span>';
+
+  var serialVal  = fmt(p.serial);
+  var serialHtml = serialVal
+    ? '<span class="cell-mono">' + esc(serialVal) + '</span>'
+    : '<span class="cell-mono na">\u2014</span>';
+
+  // DNS / rede
+  var d1v = fmt(p.dns1); var d2v = fmt(p.dns2);
+  var gwv = fmt(p.gateway); var hnv = fmt(p.hostname); var modev = fmt(p.ip_mode);
+  var d1Bad = !!(targetDns1 && d1v && d1v !== targetDns1);
+  var d2Bad = !!(targetDns2 && d2v && d2v !== targetDns2);
+  var d1Html   = dnsHtml(d1v, d1Bad);
+  var d2Html   = dnsHtml(d2v, d2Bad);
+  // data-dns-status para filtro: 'set'=tem IP, 'notset'=NOT_SET do EWS, 'none'=não coletado
+  var dnsStatus = d1v ? (d1v.toUpperCase().replace(/_| /g,'') === 'NOTSET' ? 'notset' : 'set') : 'none';
+  var hnHtml   = hnv   ? '<span class="dns-cell">' + esc(hnv)   + '</span>' : '<span class="dns-cell na">\u2014</span>';
+  var gwHtml   = gwv   ? '<span class="dns-cell">' + esc(gwv)   + '</span>' : '<span class="dns-cell na">\u2014</span>';
+  var modeHtml = modev ? '<span class="dns-cell">' + esc(modev) + '</span>' : '<span class="dns-cell na">\u2014</span>';
+
+  // Auth status icon — apenas admin pode clicar para configurar credenciais
+  var authOkNum = p.auth_ok === true ? 1 : (p.auth_ok === false ? 0 : -1);
+  var authCls   = p.auth_ok === true ? 'auth-ok' : (p.auth_ok === false ? 'auth-fail' : 'auth-none');
+  var authTip   = p.auth_ok === true
+    ? '\u2713 Web auth OK: ' + esc(p.auth_user || '') + (IS_ADMIN ? ' \u2014 clique para reconfigurar' : '')
+    : (p.auth_ok === false ? '\u2717 Falha no login web' + (IS_ADMIN ? ' \u2014 clique para configurar' : '') : 'Login web n\u00e3o tentado' + (IS_ADMIN ? ' \u2014 clique para configurar' : ''));
+  var authIcon = IS_ADMIN
+    ? '<span class="auth-icon ' + authCls + '" '
+      + 'onclick="openAuthModal(\'' + esc(p.ip) + '\',\'' + esc(p.fabricante||'') + '\',' + authOkNum + ',\'' + esc(p.auth_user||'') + '\')" '
+      + 'title="' + authTip + '">&#128273;</span>'
+    : '<span class="auth-icon ' + authCls + '" title="' + authTip + '">&#128273;</span>';
+
+  return '<tr data-ip="' + esc(p.ip) + '" data-fab="' + esc(p.fabricante||'') + '" ' +
+         'data-tipo="' + esc(p.tipo||'') + '" ' +
+         'data-serial="' + esc((p.serial||'').toLowerCase()) + '" ' +
+         'data-modelo="' + esc((p.modelo||'').toLowerCase()) + '" ' +
+         'data-dns1="' + esc(d1v||'') + '" data-dns2="' + esc(d2v||'') + '" ' +
+         'data-dns-status="' + dnsStatus + '">' +
+    '<td>' +
+      '<a href="http://' + esc(p.ip) + '/" target="_blank" class="cell-ip" title="Abrir interface web">' + esc(p.ip) + '</a>' +
+      '<a href="' + esc(PROBE_BASE) + '/probe?ip=' + esc(p.ip) + '" target="_blank" class="probe-lnk" title="Probe">&#128269;</a>' +
+      authIcon +
+    '</td>' +
+    '<td><span class="badge-mfr ' + mfrCls + '">' + esc(p.fabricante||'') + '</span></td>' +
+    '<td>' + modelHtml + '</td>' +
+    '<td>' + serialHtml + '</td>' +
+    '<td>' + metHtml + '</td>' +
+    '<td>' + tonerHtml + '</td>' +
+    '<td>' + c2Html + '</td>' +
+    '<td><span class="tipo-badge ' + tipoClass + '">' + tipoLabel + '</span></td>' +
+    (function() {
+      var st = p.status || 'Online';
+      var cls = st === 'Online' ? 'status-online' : (st === 'Offline' ? 'status-offline' : 'status-unknown');
+      return '<td><span class="' + cls + '" data-ip="' + esc(p.ip) + '">' + st + '</span></td>';
+    })() +
+    '<td>' + hnHtml + '</td>' +
+    '<td class="' + (d1Bad ? 'td-dns-bad' : '') + '">' + d1Html + '</td>' +
+    '<td class="' + (d2Bad ? 'td-dns-bad' : '') + '">' + d2Html + '</td>' +
+    '<td>' + gwHtml + '</td>' +
+    '<td>' + modeHtml + '</td>' +
+    '<td class="ts-cell">' + esc(fmtDate(p.last_updated)) + '</td>' +
+  '</tr>';
+}
+
+function updateStats(printers) {
+  var laser   = printers.filter(function(p){return p.tipo==='laser';}).length;
+  var termica = printers.filter(function(p){return p.tipo==='termica';}).length;
+  var dnsBad = 0;
+  if (targetDns1) {
+    dnsBad = printers.filter(function(p) {
+      if (p.fabricante !== 'HP' && p.fabricante !== 'Samsung') return false;
+      var ok1 = p.dns1 === targetDns1;
+      var ok2 = !targetDns2 || p.dns2 === targetDns2;
+      return !ok1 || !ok2;
+    }).length;
+  }
+  document.getElementById('st-total').textContent   = printers.length;
+  document.getElementById('st-laser').textContent   = laser;
+  document.getElementById('st-termica').textContent = termica;
+  document.getElementById('st-dns').textContent     = dnsBad;
+  document.getElementById('st-dns-card').style.display = targetDns1 ? '' : 'none';
+  _updateDnsBadge(printers);
+}
+
+// ---- Filters -------------------------------------------------------
+function applyFilters() {
+  var fIp      = document.getElementById('f-ip').value.trim().toLowerCase();
+  var fFab     = document.getElementById('f-fab').value;
+  var fTipo    = document.getElementById('f-tipo').value;
+  var fSerial  = document.getElementById('f-serial').value.trim().toLowerCase();
+  var fDnsEl   = document.getElementById('f-dns');
+  var fDns     = fDnsEl ? fDnsEl.value : '';
+  var dnsOnlyEl = document.getElementById('f-dns-only');
+  var fDnsOnly  = dnsOnlyEl && dnsOnlyEl.checked;
+  var vis = 0;
+  document.querySelectorAll('#content tbody tr').forEach(function(tr) {
+    var show = true;
+    if (fIp     && tr.dataset.ip.toLowerCase().indexOf(fIp) === -1)           show = false;
+    if (fFab    && tr.dataset.fab !== fFab)                                    show = false;
+    if (fTipo   && tr.dataset.tipo !== fTipo)                                  show = false;
+    if (fSerial && tr.dataset.serial.indexOf(fSerial) === -1
+                && tr.dataset.modelo.indexOf(fSerial) === -1)                  show = false;
+    if (fDns === 'bad') {
+      // incorreto = tem IP mas ≠ alvo (só aplica quando alvo está preenchido)
+      var d1 = tr.dataset.dns1 || '';
+      var d2 = tr.dataset.dns2 || '';
+      var dSt = tr.dataset.dnsStatus;
+      var isBad = dSt === 'set' && (
+        (targetDns1 && d1 !== targetDns1) ||
+        (targetDns2 && d2 !== targetDns2)
+      );
+      if (!isBad) show = false;
+    } else if (fDns && tr.dataset.dnsStatus !== fDns) show = false;
+    if (fDnsOnly && targetDns1) {
+      var d1ok = (tr.dataset.dns1 || '') === targetDns1;
+      var d2ok = !targetDns2 || (tr.dataset.dns2 || '') === targetDns2;
+      if (d1ok && d2ok) show = false;
+    }
+    tr.classList.toggle('row-hidden', !show);
+    if (show) vis++;
+  });
+  document.getElementById('visible-count').textContent = vis + ' impressora(s)';
+}
+
+function clearFilters(refilter) {
+  ['f-ip','f-serial'].forEach(function(id){document.getElementById(id).value='';});
+  document.getElementById('f-fab').value  = '';
+  document.getElementById('f-tipo').value = '';
+  var fDns = document.getElementById('f-dns');
+  if (fDns) fDns.value = '';
+  var dnsOnly = document.getElementById('f-dns-only');
+  if (dnsOnly) dnsOnly.checked = false;
+  if (refilter !== false) applyFilters();
+}
+
+// ---- Init ----------------------------------------------------------
+buildCdList();
+if (ALL_CDS.length === 1) selectCd(ALL_CDS[0]);
+
+// ---- Healthcheck polling — atualiza badges de status sem recarregar ----
+(function() {
+  // Só executa via Flask (not file://)
+  if (window.location.protocol === 'file:') return;
+  var _HC_INTERVAL_MS = 30000; // 30 s — mais frequente que o worker (120 s) para capturar mudanças
+  function _updateBadges() {
+    fetch(PROBE_BASE + '/api/online-status', {credentials: 'same-origin'})
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(data) {
+        if (!data) return;
+        document.querySelectorAll('[data-ip]').forEach(function(el) {
+          var ip = el.getAttribute('data-ip');
+          var st = data[ip];
+          if (!st) return;
+          var cls = st === 'Online' ? 'status-online' : (st === 'Offline' ? 'status-offline' : 'status-unknown');
+          if (el.className !== cls || el.textContent !== st) {
+            el.className  = cls;
+            el.textContent = st;
+          }
+        });
+      })
+      .catch(function() {}); // silencia erros de rede
+  }
+  setTimeout(_updateBadges, 5000);  // primeiro ping 5 s após carregamento
+  setInterval(_updateBadges, _HC_INTERVAL_MS);
+})();
+
+// ---- DNS config globals & helpers ----------------------------------
+var targetDns1       = '';
+var targetDns2       = '';
+var _currentPrinters = [];
+
+function _updateDnsBadge(printers) {
+  var badEl = document.getElementById('dns-badge-bad');
+  var okEl  = document.getElementById('dns-badge-ok');
+  if (!badEl || !okEl) return;
+  if (!targetDns1) { badEl.style.display = 'none'; okEl.style.display = 'none'; return; }
+  var bad = printers.filter(function(p) {
+    if (p.fabricante !== 'HP' && p.fabricante !== 'Samsung') return false;
+    return p.dns1 !== targetDns1 || (targetDns2 && p.dns2 !== targetDns2);
+  }).length;
+  if (bad > 0) {
+    badEl.textContent   = bad + ' incorreto' + (bad > 1 ? 's' : '');
+    badEl.style.display = ''; okEl.style.display = 'none';
+  } else {
+    okEl.style.display = ''; badEl.style.display = 'none';
+  }
+}
+
+function onTargetDnsChange() {
+  targetDns1 = (document.getElementById('target-dns1').value || '').trim();
+  targetDns2 = (document.getElementById('target-dns2').value || '').trim();
+  document.getElementById('btn-apply-dns').disabled = !targetDns1;
+  if (_currentPrinters.length) {
+    renderTable(_currentPrinters);
+    updateStats(_currentPrinters);
+    applyFilters();
+  }
+}
+
+function toggleDnsPanel() {
+  var body  = document.getElementById('dns-panel-body');
+  var arrow = document.getElementById('dns-panel-arrow');
+  if (body.style.display === 'none') {
+    body.style.display = ''; arrow.innerHTML = '&#9650;';
+  } else {
+    body.style.display = 'none'; arrow.innerHTML = '&#9660;';
+  }
+}
+
+// ---- Scan forçado --------------------------------------------------------
+var _scanPollTimer = null;
+
+function startScan(updateOnly) {
+  if (!IS_ADMIN) return;
+  var label = updateOnly ? 'Atualizar Cache' : 'Novo Scan Completo';
+  if (!confirm('Confirmar: ' + label + '?\nIsso pode levar vários minutos.')) return;
+
+  fetch(PROBE_BASE + '/api/scan/start', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({update_only: !!updateOnly}),
+  })
+  .then(function(r) {
+    if (!r.ok) {
+      return r.text().then(function(t) {
+        var hint = t.trim().startsWith('<')
+          ? 'Resposta HTML recebida — o servidor precisa ser reiniciado para aplicar a atualização.'
+          : t.slice(0, 300);
+        throw new Error('HTTP ' + r.status + ': ' + hint);
+      });
+    }
+    return r.json();
+  })
+  .then(function(d) {
+    if (d.error) { alert('Erro: ' + d.error); return; }
+    _setScanRunning(true);
+    _pollScanStatus();
+  })
+  .catch(function(e) { alert('Erro ao iniciar scan:\n' + e.message); });
+}
+
+function _setScanRunning(running) {
+  var btnFull   = document.getElementById('btn-scan-full');
+  var btnUpdate = document.getElementById('btn-scan-update');
+  var info      = document.getElementById('scan-progress-info');
+  if (btnFull)   btnFull.disabled   = running;
+  if (btnUpdate) btnUpdate.disabled = running;
+  if (info)      info.style.display = running ? '' : 'none';
+  if (!running) {
+    document.getElementById('scan-bar').style.width = '0';
+    if (_scanPollTimer) { clearTimeout(_scanPollTimer); _scanPollTimer = null; }
+  }
+}
+
+function _pollScanStatus() {
+  fetch(PROBE_BASE + '/api/status')
+  .then(function(r) { return r.json(); })
+  .then(function(s) {
+    var txt  = document.getElementById('scan-progress-text');
+    var bar  = document.getElementById('scan-bar');
+    if (s.running) {
+      var pct = s.networks_total > 0
+        ? Math.round(100 * s.networks_done / s.networks_total)
+        : (s.total > 0 ? Math.min(90, Math.round(100 * s.networks_done / Math.max(1, s.total) * 5)) : 10);
+      if (bar) bar.style.width = Math.max(5, pct) + '%';
+      if (txt) txt.innerHTML = '<b>Scan em andamento…</b> '
+        + (s.networks_total > 0
+            ? s.networks_done + '/' + s.networks_total + ' redes'
+            : s.total + ' impressoras atualizadas');
+      _scanPollTimer = setTimeout(_pollScanStatus, 2000);
+    } else {
+      if (bar) bar.style.width = '100%';
+      if (txt) txt.innerHTML = '<b style="color:#4ade80">&#10003; Scan concluído!</b> '
+        + s.total + ' impressoras — recarregando…';
+      setTimeout(function() { window.location.reload(); }, 1500);
+    }
+  })
+  .catch(function() {
+    _scanPollTimer = setTimeout(_pollScanStatus, 3000);
+  });
+}
+
+// Verifica ao carregar se já há scan em andamento (ex: servidor reiniciado mid-scan)
+(function _checkScanOnLoad() {
+  if (!IS_ADMIN) return;
+  fetch(PROBE_BASE + '/api/status')
+  .then(function(r) { return r.json(); })
+  .then(function(s) {
+    if (s.running) { _setScanRunning(true); _pollScanStatus(); }
+  })
+  .catch(function() {});
+})();
+
+// ---- Log viewer (SSE) -------------------------------------------------------
+(function _initLogViewer() {
+  if (!IS_ADMIN) return;
+  var panel   = document.getElementById('log-panel');
+  var body    = document.getElementById('log-body');
+  var dot     = document.getElementById('log-dot');
+  var statusEl= document.getElementById('log-status');
+  var countEl = document.getElementById('log-count');
+  var arrow   = document.getElementById('log-arrow');
+  var panelBody = document.getElementById('log-panel-body');
+  if (!panel) return;
+  panel.style.display = '';
+
+  var _count  = 0;
+  var _sse    = null;
+  var _open   = false;
+  var _autoScroll = true;
+
+  var _LEVEL_COLORS = {INFO:'log-INFO',WARNING:'log-WARNING',ERROR:'log-ERROR',
+                       CRITICAL:'log-CRITICAL',DEBUG:'log-DEBUG'};
+
+  function _appendEntry(e) {
+    var row = document.createElement('div');
+    row.className = 'log-entry';
+    var lvlCls = _LEVEL_COLORS[e.level] || 'log-DEBUG';
+    row.innerHTML =
+      '<span class="log-ts">' + _esc(e.ts) + '</span>' +
+      '<span class="log-lvl ' + lvlCls + '">' + _esc((e.level||'').padEnd(8)) + '</span>' +
+      '<span class="log-thread">' + _esc((e.thread||'').substring(0,18)) + '</span>' +
+      '<span class="log-msg">' + _esc(e.msg) + '</span>';
+    body.appendChild(row);
+    _count++;
+    countEl.textContent = _count + ' entradas';
+    // Remove excesso (mantém últimas 500 no DOM)
+    while (body.children.length > 500) body.removeChild(body.firstChild);
+    if (_autoScroll) body.scrollTop = body.scrollHeight;
+  }
+
+  function _esc(s) {
+    return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  function _connect() {
+    if (_sse) { _sse.close(); _sse = null; }
+    statusEl.textContent = 'Conectando…';
+    dot.className = 'log-dot paused';
+    _sse = new EventSource(PROBE_BASE + '/api/logs/stream', {withCredentials: true});
+    _sse.onopen = function() {
+      dot.className = 'log-dot';
+      statusEl.textContent = 'Ao vivo';
+    };
+    _sse.onmessage = function(ev) {
+      try { _appendEntry(JSON.parse(ev.data)); } catch(e) {}
+    };
+    _sse.onerror = function() {
+      dot.className = 'log-dot paused';
+      statusEl.textContent = 'Reconectando…';
+      _sse.close(); _sse = null;
+      setTimeout(_connect, 5000);
+    };
+  }
+
+  // Auto-scroll: pause se usuário scrollou manualmente para cima
+  body.addEventListener('scroll', function() {
+    _autoScroll = (body.scrollTop + body.clientHeight >= body.scrollHeight - 20);
+  });
+
+  window._logToggle = function() {
+    _open = !_open;
+    panelBody.style.display = _open ? '' : 'none';
+    arrow.innerHTML = _open ? '&#9650;' : '&#9660;';
+    if (_open && !_sse) _connect();
+  };
+
+  window._logClear = function() {
+    while (body.firstChild) body.removeChild(body.firstChild);
+    _count = 0; countEl.textContent = '';
+  };
+
+  // Abre automaticamente se scan estiver rodando
+  fetch(PROBE_BASE + '/api/status').then(function(r){return r.json();}).then(function(s){
+    if (s.running) window._logToggle();
+  }).catch(function(){});
+})();
+
+function applyDnsAction() {
+  if (!IS_ADMIN) { alert('Acesso restrito. Faça login no painel admin.'); return; }
+  var dns1 = (document.getElementById('target-dns1').value || '').trim();
+  var dns2 = (document.getElementById('target-dns2').value || '').trim();
+  if (!dns1) { alert('Informe o DNS Primário Alvo.'); return; }
+
+  var ips = [];
+  document.querySelectorAll('#content tbody tr:not(.row-hidden)').forEach(function(tr) {
+    var fab = tr.dataset.fab;
+    if (fab !== 'HP' && fab !== 'Samsung') return;
+    var d1ok = (tr.dataset.dns1 || '') === dns1;
+    var d2ok = !dns2 || (tr.dataset.dns2 || '') === dns2;
+    if (!d1ok || !d2ok) ips.push(tr.dataset.ip);
+  });
+  if (!ips.length) { alert('Nenhuma impressora visível com DNS incorreto.'); return; }
+
+  var btn = document.getElementById('btn-apply-dns');
+  var logEl = document.getElementById('dns-apply-log');
+
+  // --- Estado de carregamento ---
+  btn.disabled = true;
+  btn.innerHTML = '<span class="dns-spinner">&#9696;</span> Aplicando ' + ips.length + ' impressora(s)...';
+  logEl.style.display = '';
+  logEl.innerHTML = '<span class="dns-spinner">&#9696;</span> Aguardando resposta do servidor...\n'
+    + 'Isso pode levar at\u00e9 2 minutos para muitas impressoras.\n'
+    + 'N\u00e3o feche esta p\u00e1gina.';
+
+  fetch('/api/apply-dns', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({dns1: dns1, dns2: dns2, ips: ips})
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(data) {
+    var msg = 'Resultado: ' + data.ok + '/' + data.total + ' OK, ' + data.failed + ' falhou\n';
+    (data.results || []).forEach(function(r) {
+      msg += (r.ok ? '\u2713' : '\u2717') + ' ' + r.ip
+           + ' [' + (r.fabricante || '') + '] \u2014 '
+           + (r.detail || r.method || '') + '\n';
+    });
+    logEl.textContent = msg;
+    // Atualiza dados locais e re-renderiza
+    (data.results || []).forEach(function(r) {
+      if (r.ok) {
+        _currentPrinters.forEach(function(p) {
+          if (p.ip === r.ip) { p.dns1 = dns1; p.dns2 = dns2; }
+        });
+      }
+    });
+    renderTable(_currentPrinters);
+    updateStats(_currentPrinters);
+    applyFilters();
+  })
+  .catch(function(e) {
+    logEl.textContent = 'Erro: ' + String(e);
+  })
+  .finally(function() {
+    btn.disabled = false;
+    btn.innerHTML = '&#9889; Aplicar nos incorretos';
+  });
+}
+
+// ---- Scan status polling -------------------------------------------
+var _autoRefreshTimer = null;
+
+function _scheduleAutoRefresh() {
+  if (_autoRefreshTimer) clearTimeout(_autoRefreshTimer);
+  // Recarrega a página a cada 20s enquanto scan está rodando
+  _autoRefreshTimer = setTimeout(function() { location.reload(); }, 20000);
+}
+
+function _pollStatus() {
+  fetch('/api/status')
+    .then(function(r) { return r.json(); })
+    .then(function(s) {
+      var banner = document.getElementById('scan-banner');
+      var msg    = document.getElementById('scan-msg');
+      if (s.running) {
+        var pct = s.networks_total > 0
+          ? Math.round(s.networks_done / s.networks_total * 100) + '%'
+          : '...';
+        msg.textContent = 'Escaneando redes — '
+          + s.networks_done + '/' + s.networks_total + ' redes (' + pct + ') — '
+          + s.total + ' impressora(s) encontrada(s)';
+        banner.className = 'scan-banner running';
+        banner.style.display = 'flex';
+        _scheduleAutoRefresh();
+        setTimeout(_pollStatus, 5000);
+      } else if (s.total > 0) {
+        if (_autoRefreshTimer) { clearTimeout(_autoRefreshTimer); _autoRefreshTimer = null; }
+        // Se acabou de terminar (finished_at recente, menos de 30s atrás)
+        var finished = s.finished_at ? new Date(s.finished_at) : null;
+        var justDone = finished && (Date.now() - finished.getTime() < 30000);
+        if (justDone) {
+          msg.textContent = 'Scan conclu\u00eddo \u2014 ' + s.total + ' impressora(s) encontrada(s). Recarregando...';
+          banner.className = 'scan-banner done';
+          banner.style.display = 'flex';
+          setTimeout(function() { location.reload(); }, 1500);
+        } else {
+          banner.style.display = 'none';
+        }
+      } else {
+        banner.style.display = 'none';
+      }
+    })
+    .catch(function() { /* servidor pode não ter /api/status */ });
+}
+
+// ---- CSV Export ---------------------------------------------------------
+function exportCSV() {
+  var activeItem = document.querySelector('.cd-item.active');
+  var cd = activeItem ? (activeItem.dataset.cd || '') : '';
+  var url = PROBE_BASE + '/api/export-csv' + (cd ? '?cd=' + encodeURIComponent(cd) : '');
+  var a = document.createElement('a');
+  a.href = url; a.download = ''; a.style.display = 'none';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+}
+
+// ---- Credentials Modal ---------------------------------------------------
+function openAuthModal(ip, fab, authOk, authUser) {
+  if (!IS_ADMIN) return; // Somente admins podem configurar credenciais
+  document.getElementById('cred-ip').value   = ip;
+  document.getElementById('cred-fab').value  = fab;
+  document.getElementById('cred-user').value = '';
+  document.getElementById('cred-pass').value = '';
+  var s = document.getElementById('cred-status');
+  if (authOk === 1) {
+    s.textContent = '\u2713 Autenticado como: ' + (authUser || 'ok');
+    s.className = 'modal-status ok';
+  } else if (authOk === 0) {
+    s.textContent = '\u2717 Falha no login web \u2014 insira as credenciais corretas abaixo.';
+    s.className = 'modal-status fail';
+  } else {
+    s.textContent = 'Login web n\u00e3o tentado ou SNMP foi suficiente.';
+    s.className = 'modal-status';
+  }
+  document.getElementById('auth-modal').classList.remove('hidden');
+  setTimeout(function() { document.getElementById('cred-user').focus(); }, 50);
+}
+
+function closeAuthModal() {
+  document.getElementById('auth-modal').classList.add('hidden');
+}
+
+function submitCredentials() {
+  if (!IS_ADMIN) { alert('Acesso restrito. Faça login no painel admin.'); return; }
+  var ip   = document.getElementById('cred-ip').value;
+  var user = document.getElementById('cred-user').value.trim();
+  var pass = document.getElementById('cred-pass').value;
+  if (!user) { alert('Informe o usu\u00e1rio.'); return; }
+  var btn = document.getElementById('btn-cred-save');
+  var s   = document.getElementById('cred-status');
+  btn.disabled = true; btn.textContent = 'Testando...';
+  s.textContent = 'Salvando e testando conex\u00e3o...'; s.className = 'modal-status';
+  fetch(PROBE_BASE + '/api/set-credentials', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ip: ip, user: user, password: pass})
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(data) {
+    if (data.auth_ok === true) {
+      s.textContent = '\u2713 Login OK! DNS e rede atualizados no cache.';
+      s.className = 'modal-status ok';
+      var p = _currentPrinters.find(function(x) { return x.ip === ip; });
+      if (p) {
+        p.auth_ok = true; p.auth_user = data.auth_user;
+        var nc = data.netcfg || {};
+        ['dns1','dns2','gateway','hostname','ip_mode'].forEach(function(k) {
+          if (nc[k]) p[k] = nc[k];
+        });
+        renderTable(_currentPrinters); applyFilters(); updateStats(_currentPrinters);
+      }
+    } else if (data.auth_ok === false) {
+      s.textContent = '\u2717 Credenciais salvas, mas login falhou. Verifique usu\u00e1rio/senha.';
+      s.className = 'modal-status fail';
+    } else {
+      s.textContent = 'Credenciais salvas. Resultado da coleta: ' + JSON.stringify(data.netcfg || {});
+      s.className = 'modal-status';
+    }
+  })
+  .catch(function(e) {
+    var msg = String(e);
+    if (msg.indexOf('fetch') !== -1 || msg.indexOf('NetworkError') !== -1 || msg.indexOf('Failed') !== -1) {
+      s.innerHTML = '\u26a0\ufe0f O servidor Flask n\u00e3o est\u00e1 rodando ou n\u00e3o est\u00e1 acess\u00edvel.<br>'
+        + '<small style="color:#94a3b8">Execute: <code style="background:#0f1117;padding:1px 5px;border-radius:3px">python scan_printers.py --probe-only</code>'
+        + '<br>Depois abra este invent\u00e1rio pelo servidor: '
+        + '<a href="' + PROBE_BASE + '/results" target="_blank" style="color:#60a5fa">' + PROBE_BASE + '/results</a></small>';
+    } else {
+      s.textContent = 'Erro: ' + msg;
+    }
+    s.className = 'modal-status fail';
+  })
+  .finally(function() { btn.disabled = false; btn.textContent = 'Salvar e Testar'; });
+}
+
+// Detecta abertura como file:// e exibe aviso
+if (location.protocol === 'file:') {
+  var fw = document.getElementById('flask-warn');
+  if (fw) fw.style.display = 'block';
+}
+
+_pollStatus();
+</script>
+
+<!-- ======= CREDENTIALS MODAL ======= -->
+<div id="auth-modal" class="modal-overlay hidden" onclick="if(event.target===this)closeAuthModal()">
+  <div class="modal-box">
+    <h3>&#128273; Credenciais do Equipamento</h3>
+    <div style="display:flex;gap:10px">
+      <div class="modal-field" style="flex:1">
+        <label>IP</label>
+        <input type="text" id="cred-ip" readonly>
+      </div>
+      <div class="modal-field" style="flex:1">
+        <label>Fabricante</label>
+        <input type="text" id="cred-fab" readonly>
+      </div>
+    </div>
+    <div class="modal-field">
+      <label>Usu&aacute;rio</label>
+      <input type="text" id="cred-user" placeholder="admin / administrador" autocomplete="off">
+    </div>
+    <div class="modal-field">
+      <label>Senha</label>
+      <input type="password" id="cred-pass" placeholder="Senha da interface web" autocomplete="new-password"
+             onkeydown="if(event.key==='Enter')submitCredentials()">
+    </div>
+    <div id="cred-status" class="modal-status"></div>
+    <div class="modal-actions">
+      <button class="btn-mc btn-mc-cancel" onclick="closeAuthModal()">Cancelar</button>
+      <button id="btn-cred-save" class="btn-mc btn-mc-confirm" onclick="submitCredentials()">Salvar e Testar</button>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>
+
